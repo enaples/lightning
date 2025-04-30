@@ -21,6 +21,7 @@
 #include <lightningd/coin_mvts.h>
 #include <lightningd/notification.h>
 #include <lightningd/peer_control.h>
+#include <lightningd/peer_htlcs.h>
 #include <lightningd/runes.h>
 #include <onchaind/onchaind_wiregen.h>
 #include <wallet/invoices.h>
@@ -1671,7 +1672,7 @@ static struct short_channel_id *db_col_optional_scid(const tal_t *ctx,
 	if (db_col_is_null(stmt, colname))
 		return NULL;
 
-	scid = tal(tmpctx, struct short_channel_id);
+	scid = tal(ctx, struct short_channel_id);
 	*scid = db_col_short_channel_id(stmt, colname);
 	return scid;
 }
@@ -1762,7 +1763,7 @@ static struct channel *wallet_stmt2channel(struct wallet *w, struct db_stmt *stm
 	alias[LOCAL] = db_col_optional_scid(tmpctx, stmt, "alias_local");
 	alias[REMOTE] = db_col_optional_scid(tmpctx, stmt, "alias_remote");
 
-	ok &= wallet_shachain_load(w, db_col_u64(stmt, "shachain_remote_id"),
+ 	ok &= wallet_shachain_load(w, db_col_u64(stmt, "shachain_remote_id"),
 				   &wshachain);
 
 	remote_shutdown_scriptpubkey = db_col_arr(tmpctx, stmt,
@@ -2032,6 +2033,7 @@ static struct closed_channel *wallet_stmt2closed_channel(const tal_t *ctx,
 							 struct db_stmt *stmt)
 {
 	struct closed_channel *cc = tal(ctx, struct closed_channel);
+	struct wallet_shachain wshachain;
 
 	/* Can be missing in older dbs! */
 	cc->peer_id = db_col_optional(cc, stmt, "p.node_id", node_id);
@@ -2064,15 +2066,19 @@ static struct closed_channel *wallet_stmt2closed_channel(const tal_t *ctx,
 	cc->state_change_cause
 		= state_change_in_db(db_col_int(stmt, "state_change_reason"));
 	cc->leased = !db_col_is_null(stmt, "lease_commit_sig");
+	/* This was deleted on channel closure for older dbs! */
+	if (wallet_shachain_load(w, db_col_u64(stmt, "shachain_remote_id"), &wshachain))
+		cc->their_shachain = tal_dup(cc, struct shachain, &wshachain.chain);
+	else
+		cc->their_shachain = NULL;
 
 	return cc;
 }
 
-struct closed_channel **wallet_load_closed_channels(const tal_t *ctx,
-						    struct wallet *w)
+void wallet_load_closed_channels(struct wallet *w,
+				 struct closed_channel_map *cc_map)
 {
 	struct db_stmt *stmt;
-	struct closed_channel **chans = tal_arr(ctx, struct closed_channel *, 0);
 
 	/* We load all channels */
 	stmt = db_prepare_v2(w->db, SQL("SELECT "
@@ -2099,6 +2105,7 @@ struct closed_channel **wallet_load_closed_channels(const tal_t *ctx,
 					", state_change_reason"
 					", lease_commit_sig"
 					", last_stable_connection"
+					", shachain_remote_id"
 					" FROM channels"
 					" LEFT JOIN peers p ON p.id = peer_id"
                                         " WHERE state = ?;"));
@@ -2106,12 +2113,54 @@ struct closed_channel **wallet_load_closed_channels(const tal_t *ctx,
 	db_query_prepared(stmt);
 
 	while (db_step(stmt)) {
-		struct closed_channel *cc = wallet_stmt2closed_channel(chans,
+		struct closed_channel *cc = wallet_stmt2closed_channel(cc_map,
 								       w, stmt);
-		tal_arr_expand(&chans, cc);
+		closed_channel_map_add(cc_map, cc);
 	}
 	tal_free(stmt);
-	return chans;
+}
+
+void wallet_load_one_closed_channel(struct wallet *w,
+				    struct closed_channel_map *cc_map,
+				    u64 wallet_id)
+{
+	struct db_stmt *stmt;
+
+	stmt = db_prepare_v2(w->db, SQL("SELECT "
+					" p.node_id"
+					", full_channel_id"
+					", scid"
+					", alias_local"
+					", alias_remote"
+					", funder"
+					", closer"
+					", channel_flags"
+					", next_index_local"
+					", next_index_remote"
+					", next_htlc_id"
+					", funding_tx_id"
+					", funding_tx_outnum"
+					", funding_satoshi"
+					", push_msatoshi"
+					", msatoshi_local"
+					", msatoshi_to_us_min"
+					", msatoshi_to_us_max"
+					", last_tx"
+					", channel_type"
+					", state_change_reason"
+					", lease_commit_sig"
+					", last_stable_connection"
+					", shachain_remote_id"
+					" FROM channels"
+					" LEFT JOIN peers p ON p.id = peer_id"
+                                        " WHERE channels.id = ?;"));
+	db_bind_u64(stmt, wallet_id);
+	db_query_prepared(stmt);
+
+	db_step(stmt);
+	closed_channel_map_add(cc_map,
+			       wallet_stmt2closed_channel(cc_map, w, stmt));
+	tal_free(stmt);
 }
 
 static void set_max_channel_dbid(struct wallet *w)
@@ -2810,40 +2859,86 @@ void wallet_channel_insert(struct wallet *w, struct channel *chan)
 	wallet_channel_save(w, chan);
 }
 
-void wallet_channel_close(struct wallet *w, u64 wallet_id)
+void wallet_channel_close(struct wallet *w,
+			  const struct channel *chan)
 {
-	/* We keep a couple of dependent tables around as well, such as the
-	 * channel_configs table, since that might help us debug some issues,
-	 * and it is rather limited in size. Tables that can grow quite
-	 * considerably and that are of limited use after channel closure will
-	 * be pruned as well. */
-
+	/* We keep the entry in the channel_configs table, since that might
+	 * help us debug some issues, and it is rather limited in size.  We
+	 * also keep shachains: it's limited and we can use it for sending
+	 * reestablish messages with enough information for nodes with lost
+	 * dbs to recover. */
 	struct db_stmt *stmt;
 
 	/* Delete entries from `channel_htlcs` */
 	stmt = db_prepare_v2(w->db, SQL("DELETE FROM channel_htlcs "
 					"WHERE channel_id=?"));
-	db_bind_u64(stmt, wallet_id);
-	db_exec_prepared_v2(take(stmt));
+	db_bind_u64(stmt, chan->dbid);
+	db_exec_prepared_v2(stmt);
+	/* FIXME: We don't actually tell them what was deleted! */
+	if (db_count_changes(stmt) != 0)
+		htlcs_index_deleted(w->ld, chan, db_count_changes(stmt));
+	tal_free(stmt);
 
 	/* Delete entries from `htlc_sigs` */
 	stmt = db_prepare_v2(w->db, SQL("DELETE FROM htlc_sigs "
 					"WHERE channelid=?"));
-	db_bind_u64(stmt, wallet_id);
+	db_bind_u64(stmt, chan->dbid);
 	db_exec_prepared_v2(take(stmt));
 
 	/* Delete entries from `htlc_sigs` */
 	stmt = db_prepare_v2(w->db, SQL("DELETE FROM channeltxs "
 					"WHERE channel_id=?"));
-	db_bind_u64(stmt, wallet_id);
+	db_bind_u64(stmt, chan->dbid);
 	db_exec_prepared_v2(take(stmt));
 
 	/* Delete any entries from 'inflights' */
 	stmt = db_prepare_v2(w->db,
 			     SQL("DELETE FROM channel_funding_inflights "
 				 " WHERE channel_id=?"));
-	db_bind_u64(stmt, wallet_id);
+	db_bind_u64(stmt, chan->dbid);
 	db_exec_prepared_v2(take(stmt));
+
+	/* Delete transaction annotations */
+	stmt = db_prepare_v2(w->db, SQL("DELETE FROM transaction_annotations "
+					"WHERE channel=?"));
+	db_bind_u64(stmt, chan->dbid);
+	db_exec_prepared_v2(take(stmt));
+
+	/* Delete feerates */
+	stmt = db_prepare_v2(w->db, SQL("DELETE FROM channel_feerates "
+					"WHERE channel_id=?"));
+	db_bind_u64(stmt, chan->dbid);
+	db_exec_prepared_v2(take(stmt));
+
+	/* Delete anchor information */
+	stmt = db_prepare_v2(w->db, SQL("DELETE FROM local_anchors "
+					"WHERE channel_id=?"));
+	db_bind_u64(stmt, chan->dbid);
+	db_exec_prepared_v2(take(stmt));
+
+	/* Set the channel to closed */
+	stmt = db_prepare_v2(w->db, SQL("UPDATE channels "
+					"SET state=? "
+					"WHERE channels.id=?"));
+	db_bind_u64(stmt, channel_state_in_db(CLOSED));
+	db_bind_u64(stmt, chan->dbid);
+	db_exec_prepared_v2(take(stmt));
+}
+
+/* Completely unused channels get wiped entirely (we've already closed it above) */
+void wallet_channel_delete(struct wallet *w, const struct channel *channel)
+{
+	struct db_stmt *stmt;
+
+	/* Delete channel configuration for both sides */
+	stmt = db_prepare_v2(w->db, SQL("DELETE FROM channel_configs"
+					" WHERE id=? OR id=?"));
+	db_bind_u64(stmt, channel->channel_info.their_config.id);
+	db_bind_u64(stmt, channel->our_config.id);
+	db_exec_prepared_v2(stmt);
+
+	assert(db_count_changes(stmt) == 2);
+	tal_free(stmt);
 
 	/* Delete shachains */
 	stmt = db_prepare_v2(w->db, SQL("DELETE FROM shachains "
@@ -2852,16 +2947,21 @@ void wallet_channel_close(struct wallet *w, u64 wallet_id)
 					"  FROM channels "
 					"  WHERE channels.id=?"
 					")"));
-	db_bind_u64(stmt, wallet_id);
-	db_exec_prepared_v2(take(stmt));
+	db_bind_u64(stmt, channel->dbid);
+	db_exec_prepared_v2(stmt);
 
-	/* Set the channel to closed */
-	stmt = db_prepare_v2(w->db, SQL("UPDATE channels "
-					"SET state=? "
-					"WHERE channels.id=?"));
+	assert(db_count_changes(stmt) == 1);
+	tal_free(stmt);
+
+	stmt = db_prepare_v2(w->db, SQL("DELETE FROM channels"
+					" WHERE state = ?"
+					" AND id=?"));
 	db_bind_u64(stmt, channel_state_in_db(CLOSED));
-	db_bind_u64(stmt, wallet_id);
-	db_exec_prepared_v2(take(stmt));
+	db_bind_u64(stmt, channel->dbid);
+	db_exec_prepared_v2(stmt);
+
+	assert(db_count_changes(stmt) == 1);
+	tal_free(stmt);
 }
 
 void wallet_channel_inflight_cleanup_incomplete(struct wallet *w, u64 wallet_id)
@@ -3007,6 +3107,7 @@ void wallet_htlc_save_in(struct wallet *wallet,
 
 	stmt = db_prepare_v2(wallet->db,
 			     SQL("INSERT INTO channel_htlcs ("
+				 " id,"
 				 " channel_id,"
 				 " channel_htlc_id, "
 				 " direction,"
@@ -3020,8 +3121,17 @@ void wallet_htlc_save_in(struct wallet *wallet,
 				 " received_time,"
 				 " min_commit_num, "
 				 " fail_immediate) VALUES "
-				 "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);"));
+				 "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);"));
 
+	in->dbid = htlcs_index_created(wallet->ld,
+				       in->key.id,
+				       chan,
+				       &in->payment_hash,
+				       REMOTE,
+				       in->cltv_expiry,
+				       in->msat,
+				       in->hstate);
+	db_bind_u64(stmt, in->dbid);
 	db_bind_u64(stmt, chan->dbid);
 	db_bind_u64(stmt, in->key.id);
 	db_bind_int(stmt, DIRECTION_INCOMING);
@@ -3049,8 +3159,7 @@ void wallet_htlc_save_in(struct wallet *wallet,
 
 	db_bind_int(stmt, in->fail_immediate);
 
-	db_exec_prepared_v2(stmt);
-	in->dbid = db_last_insert_id_v2(take(stmt));
+	db_exec_prepared_v2(take(stmt));
 }
 
 void wallet_htlc_save_out(struct wallet *wallet,
@@ -3066,6 +3175,7 @@ void wallet_htlc_save_out(struct wallet *wallet,
 	stmt = db_prepare_v2(
 	    wallet->db,
 	    SQL("INSERT INTO channel_htlcs ("
+		" id,"
 		" channel_id,"
 		" channel_htlc_id,"
 		" direction,"
@@ -3081,8 +3191,17 @@ void wallet_htlc_save_out(struct wallet *wallet,
 		" groupid,"
 		" fees_msat,"
 		" min_commit_num"
-		") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?);"));
+		") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?);"));
 
+	out->dbid = htlcs_index_created(wallet->ld,
+					out->key.id,
+					chan,
+					&out->payment_hash,
+					LOCAL,
+					out->cltv_expiry,
+					out->msat,
+					out->hstate);
+	db_bind_u64(stmt, out->dbid);
 	db_bind_u64(stmt, chan->dbid);
 	db_bind_u64(stmt, out->key.id);
 	db_bind_int(stmt, DIRECTION_OUTGOING);
@@ -3116,9 +3235,7 @@ void wallet_htlc_save_out(struct wallet *wallet,
 	db_bind_u64(stmt, min_u64(chan->next_index[LOCAL]-1,
 					     chan->next_index[REMOTE]-1));
 
-	db_exec_prepared_v2(stmt);
-	out->dbid = db_last_insert_id_v2(stmt);
-	tal_free(stmt);
+	db_exec_prepared_v2(take(stmt));
 }
 
 /* input htlcs use failcode & failonion & we_filled, output htlcs use failmsg & failonion */
@@ -3129,7 +3246,13 @@ void wallet_htlc_update(struct wallet *wallet, const u64 htlc_dbid,
 			enum onion_wire badonion,
 			const struct onionreply *failonion,
 			const u8 *failmsg,
-			bool *we_filled)
+			const bool *we_filled,
+			u64 htlc_id,
+			const struct channel *channel,
+			enum side owner,
+			const struct sha256 *payment_hash,
+			u32 expiry,
+			struct amount_msat amount)
 {
 	struct db_stmt *stmt;
 	bool terminal = (new_state == RCVD_REMOVE_ACK_REVOCATION
@@ -3144,7 +3267,7 @@ void wallet_htlc_update(struct wallet *wallet, const u64 htlc_dbid,
 	stmt = db_prepare_v2(
 	    wallet->db, SQL("UPDATE channel_htlcs SET hstate=?, payment_key=?, "
 			    "malformed_onion=?, failuremsg=?, localfailmsg=?, "
-			    "we_filled=?, max_commit_num=?"
+			    "we_filled=?, max_commit_num=?, updated_index=? "
 			    " WHERE id=?"));
 
 	db_bind_int(stmt, htlc_state_in_db(new_state));
@@ -3173,9 +3296,19 @@ void wallet_htlc_update(struct wallet *wallet, const u64 htlc_dbid,
 		db_bind_u64(stmt, max_commit_num);
 	else
 		db_bind_null(stmt);
+	db_bind_u64(stmt, htlcs_index_update_status(wallet->ld,
+						    htlc_id,
+						    channel,
+						    payment_hash,
+						    owner,
+						    expiry,
+						    amount,
+						    new_state));
 	db_bind_u64(stmt, htlc_dbid);
 
-	db_exec_prepared_v2(take(stmt));
+	db_exec_prepared_v2(stmt);
+	assert(db_count_changes(stmt) == 1);
+	tal_free(stmt);
 
 	if (terminal) {
 		/* If it's terminal, remove the data we needed for re-xmission. */
@@ -6153,13 +6286,18 @@ struct wallet_htlc_iter {
 struct wallet_htlc_iter *wallet_htlcs_first(const tal_t *ctx,
 					    struct wallet *w,
 					    const struct channel *chan,
+					    const enum wait_index *listindex,
+					    u64 liststart,
+					    const u32 *listlimit,
 					    struct short_channel_id *scid,
 					    u64 *htlc_id,
 					    int *cltv_expiry,
 					    enum side *owner,
 					    struct amount_msat *msat,
 					    struct sha256 *payment_hash,
-					    enum htlc_state *hstate)
+					    enum htlc_state *hstate,
+					    u64 *created_index,
+					    u64 *updated_index)
 {
 	struct wallet_htlc_iter *i = tal(ctx, struct wallet_htlc_iter);
 
@@ -6168,20 +6306,44 @@ struct wallet_htlc_iter *wallet_htlcs_first(const tal_t *ctx,
 		assert(i->scid.u64 != 0);
 		assert(chan->dbid != 0);
 
-		i->stmt = db_prepare_v2(w->db,
+		if (listindex && *listindex == WAIT_INDEX_UPDATED) {
+			i->stmt = db_prepare_v2(w->db,
 					SQL("SELECT h.channel_htlc_id"
 					    ", h.cltv_expiry"
 					    ", h.direction"
 					    ", h.msatoshi"
 					    ", h.payment_hash"
 					    ", h.hstate"
+					    ", h.id"
+					    ", h.updated_index"
 					    " FROM channel_htlcs h"
 					    " WHERE channel_id = ?"
-					    " ORDER BY id ASC"));
+					    " AND"
+					    "  updated_index >= ?"
+					    " ORDER BY h.updated_index ASC"
+					    " LIMIT ?;"));
+		} else {
+			i->stmt = db_prepare_v2(w->db,
+					SQL("SELECT h.channel_htlc_id"
+					    ", h.cltv_expiry"
+					    ", h.direction"
+					    ", h.msatoshi"
+					    ", h.payment_hash"
+					    ", h.hstate"
+					    ", h.id"
+					    ", h.updated_index"
+					    " FROM channel_htlcs h"
+					    " WHERE channel_id = ?"
+					    " AND"
+					    "  id >= ?"
+					    " ORDER BY h.id ASC"
+					    " LIMIT ?;"));
+		}
 		db_bind_u64(i->stmt, chan->dbid);
 	} else {
 		i->scid.u64 = 0;
-		i->stmt = db_prepare_v2(w->db,
+		if (listindex && *listindex == WAIT_INDEX_UPDATED) {
+			i->stmt = db_prepare_v2(w->db,
 					SQL("SELECT channels.scid"
 					    ", channels.alias_local"
 					    ", h.channel_htlc_id"
@@ -6190,17 +6352,46 @@ struct wallet_htlc_iter *wallet_htlcs_first(const tal_t *ctx,
 					    ", h.msatoshi"
 					    ", h.payment_hash"
 					    ", h.hstate"
+					    ", h.id"
+					    ", h.updated_index"
 					    " FROM channel_htlcs h"
 					    " JOIN channels ON channels.id = h.channel_id"
-					    " ORDER BY h.id ASC"));
+					    " WHERE h.updated_index >= ?"
+					    " ORDER BY h.updated_index ASC"
+					    " LIMIT ?;"));
+		} else {
+			i->stmt = db_prepare_v2(w->db,
+					SQL("SELECT channels.scid"
+					    ", channels.alias_local"
+					    ", h.channel_htlc_id"
+					    ", h.cltv_expiry"
+					    ", h.direction"
+					    ", h.msatoshi"
+					    ", h.payment_hash"
+					    ", h.hstate"
+					    ", h.id"
+					    ", h.updated_index"
+					    " FROM channel_htlcs h"
+					    " JOIN channels ON channels.id = h.channel_id"
+					    " WHERE h.id >= ?"
+					    " ORDER BY h.id ASC"
+					    " LIMIT ?;"));
+		}
 	}
+	db_bind_u64(i->stmt, liststart);
+	if (listlimit)
+		db_bind_int(i->stmt, *listlimit);
+	else
+		db_bind_int(i->stmt, INT_MAX);
+
 	/* FIXME: db_prepare should take ctx! */
 	tal_steal(i, i->stmt);
 	db_query_prepared(i->stmt);
 
 	return wallet_htlcs_next(w, i,
 				 scid, htlc_id, cltv_expiry, owner, msat,
-				 payment_hash, hstate);
+				 payment_hash, hstate,
+				 created_index, updated_index);
 }
 
 struct wallet_htlc_iter *wallet_htlcs_next(struct wallet *w,
@@ -6211,7 +6402,9 @@ struct wallet_htlc_iter *wallet_htlcs_next(struct wallet *w,
 					   enum side *owner,
 					   struct amount_msat *msat,
 					   struct sha256 *payment_hash,
-					   enum htlc_state *hstate)
+					   enum htlc_state *hstate,
+					   u64 *created_index,
+					   u64 *updated_index)
 {
 	if (!db_step(iter->stmt))
 		return tal_free(iter);
@@ -6235,6 +6428,8 @@ struct wallet_htlc_iter *wallet_htlcs_next(struct wallet *w,
 	db_col_sha256(iter->stmt, "h.payment_hash", payment_hash);
 	*cltv_expiry = db_col_int(iter->stmt, "h.cltv_expiry");
 	*hstate = db_col_int(iter->stmt, "h.hstate");
+	*created_index = db_col_u64(iter->stmt, "h.id");
+	*updated_index = db_col_u64(iter->stmt, "h.updated_index");
 	return iter;
 }
 

@@ -120,6 +120,9 @@ void handle_early_opts(struct lightningd *ld UNNEEDED, int argc UNNEEDED, char *
 /* Generated stub for handle_opts */
 void handle_opts(struct lightningd *ld UNNEEDED)
 { fprintf(stderr, "handle_opts called!\n"); abort(); }
+/* Generated stub for hash_cid */
+size_t hash_cid(const struct channel_id *cid UNNEEDED)
+{ fprintf(stderr, "hash_cid called!\n"); abort(); }
 /* Generated stub for hash_htlc_key */
 size_t hash_htlc_key(const struct htlc_key *htlc_key UNNEEDED)
 { fprintf(stderr, "hash_htlc_key called!\n"); abort(); }
@@ -266,12 +269,9 @@ void towire_node_id(u8 **pptr UNNEEDED, const struct node_id *id UNNEEDED)
 /* Generated stub for trace_span_end */
 void trace_span_end(const void *key UNNEEDED)
 { fprintf(stderr, "trace_span_end called!\n"); abort(); }
-/* Generated stub for trace_span_resume_ */
-void trace_span_resume_(const void *key UNNEEDED, const char *lbl UNNEEDED)
-{ fprintf(stderr, "trace_span_resume_ called!\n"); abort(); }
-/* Generated stub for trace_span_start */
-void trace_span_start(const char *name UNNEEDED, const void *key UNNEEDED)
-{ fprintf(stderr, "trace_span_start called!\n"); abort(); }
+/* Generated stub for trace_span_start_ */
+void trace_span_start_(const char *name UNNEEDED, const void *key UNNEEDED)
+{ fprintf(stderr, "trace_span_start_ called!\n"); abort(); }
 /* Generated stub for txfilter_add_derkey */
 void txfilter_add_derkey(struct txfilter *filter UNNEEDED,
 			 const u8 derkey[PUBKEY_CMPR_LEN])

@@ -67,6 +67,7 @@
 #include <lightningd/channel.h>
 #include <lightningd/channel_control.h>
 #include <lightningd/channel_gossip.h>
+#include <lightningd/closed_channel.h>
 #include <lightningd/coin_mvts.h>
 #include <lightningd/connect_control.h>
 #include <lightningd/gossip_control.h>
@@ -211,6 +212,11 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	 * in limbo until we get all the parts, or we time them out. */
 	ld->htlc_sets = tal(ld, struct htlc_set_map);
 	htlc_set_map_init(ld->htlc_sets);
+
+	/*~ We keep a map of closed channels.  Mainly so we can respond to peers
+	 * who talk to us about long-closed channels. */
+	ld->closed_channels = tal(ld, struct closed_channel_map);
+	closed_channel_map_init(ld->closed_channels);
 
 	/*~ We have a multi-entry log-book infrastructure: we define a 10MB log
 	 * book to hold all the entries (and trims as necessary), and multiple
@@ -1409,14 +1415,6 @@ int main(int argc, char *argv[])
 	/*~ Now handle sigchld, so we can clean up appropriately. */
 	sigchld_conn = notleak(io_new_conn(ld, sigchld_rfd, sigchld_rfd_in, ld));
 
-	/* This span was started before handing control to `io_loop`
-	 * which suspends active spans in-between processing
-	 * events. Depending on how the `io_loop` was interrupted, the
-	 * current context span may have been suspended. We need to
-	 * manually resume it for this case. Notice that resuming is
-	 * idempotent, and doing so repeatedly is safe.
-	 */
-	trace_span_resume(argv);
 	trace_span_end(argv);
 
 	/*~ Mark ourselves live.

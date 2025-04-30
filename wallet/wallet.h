@@ -21,6 +21,7 @@ struct amount_msat;
 struct invoices;
 struct channel;
 struct channel_inflight;
+struct closed_channel_map;
 struct htlc_in;
 struct htlc_in_map;
 struct htlc_out;
@@ -696,7 +697,13 @@ void wallet_channel_clear_inflights(struct wallet *w,
 /**
  * After fully resolving a channel, only keep a lightweight stub
  */
-void wallet_channel_close(struct wallet *w, u64 wallet_id);
+void wallet_channel_close(struct wallet *w,
+			  const struct channel *chan);
+
+/**
+ * If it was never used, we can forget it entirely after wallet_channel_close.
+ */
+void wallet_channel_delete(struct wallet *w, const struct channel *channel);
 
 /**
  * Adds a channel state change history entry into the database
@@ -727,13 +734,25 @@ bool wallet_init_channels(struct wallet *w);
 
 /**
  * wallet_load_closed_channels -- Loads dead channels.
- * @ctx: context to allocate returned array from
  * @w: wallet to load from
+ * @cc_map: the map to fill
  *
  * These will be all state CLOSED.
  */
-struct closed_channel **wallet_load_closed_channels(const tal_t *ctx,
-						    struct wallet *w);
+void wallet_load_closed_channels(struct wallet *w,
+				 struct closed_channel_map *cc_map);
+
+/**
+ * wallet_load_one_closed_channel -- Loads one single (just-closed) channel.
+ * @w: wallet to load from
+ * @cc_map: the map to fill
+ * @wallet_id: the id of the channel.
+ *
+ * Must be newly closed via wallet_channel_close().
+ */
+void wallet_load_one_closed_channel(struct wallet *w,
+				    struct closed_channel_map *cc_map,
+				    u64 wallet_id);
 
 /**
  * wallet_channel_stats_incr_* - Increase channel statistics.
@@ -803,6 +822,11 @@ void wallet_htlc_save_out(struct wallet *wallet,
  * @failonion: the current failure onion message (from peer), or NULL.
  * @failmsg: the current local failure message, or NULL.
  * @we_filled: for htlc-ins, true if we originated the preimage.
+ * @htlc_id: the HTLC number from update_add_htlc.
+ * @scid: the short_channel_id it relates to
+ * @payment_hash: the payment hash
+ * @expiry: the cltv_expiry from update_add_htlc
+ * @amount: the amount from update_add_htlc.
  *
  * Used to update the state of an HTLC, either a `struct htlc_in` or a
  * `struct htlc_out` and optionally set the `payment_key` should the
@@ -815,7 +839,13 @@ void wallet_htlc_update(struct wallet *wallet, const u64 htlc_dbid,
 			enum onion_wire badonion,
 			const struct onionreply *failonion,
 			const u8 *failmsg,
-			bool *we_filled);
+			const bool *we_filled,
+			u64 htlc_id,
+			const struct channel *channel,
+			enum side owner,
+			const struct sha256 *payment_hash,
+			u32 expiry,
+			struct amount_msat amount);
 
 /**
  * wallet_htlcs_load_in_for_channel - Load incoming HTLCs associated with chan from DB.
@@ -1673,13 +1703,18 @@ bool datastore_key_eq(const char **k1, const char **k2);
 struct wallet_htlc_iter *wallet_htlcs_first(const tal_t *ctx,
 					    struct wallet *w,
 					    const struct channel *chan,
+					    const enum wait_index *listindex,
+					    u64 liststart,
+					    const u32 *listlimit,
 					    struct short_channel_id *scid,
 					    u64 *htlc_id,
 					    int *cltv_expiry,
 					    enum side *owner,
 					    struct amount_msat *msat,
 					    struct sha256 *payment_hash,
-					    enum htlc_state *hstate);
+					    enum htlc_state *hstate,
+					    u64 *created_index,
+					    u64 *updated_index);
 
 /**
  * Iterate through the htlcs table.
@@ -1697,7 +1732,9 @@ struct wallet_htlc_iter *wallet_htlcs_next(struct wallet *w,
 					   enum side *owner,
 					   struct amount_msat *msat,
 					   struct sha256 *payment_hash,
-					   enum htlc_state *hstate);
+					   enum htlc_state *hstate,
+					   u64 *created_index,
+					   u64 *updated_index);
 
 /* Make a PSBT from these utxos, or enhance @base if non-NULL. */
 struct wally_psbt *psbt_using_utxos(const tal_t *ctx,
