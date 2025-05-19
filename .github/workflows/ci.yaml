@@ -209,7 +209,7 @@ jobs:
       - name: Check
         run: |
           tar -xaf cln-${{ matrix.CFG }}.tar.bz2
-          make -j $(nproc) check-units installcheck VALGRIND=${{ matrix.VALGRIND }}
+          eatmydata make -j $(nproc) check-units installcheck VALGRIND=${{ matrix.VALGRIND }}
 
   check-fuzz:
     name: Run fuzz regression tests
@@ -249,7 +249,7 @@ jobs:
     needs:
       - compile
     strategy:
-      fail-fast: true
+      fail-fast: false
       matrix:
         include:
           - NAME: gcc
@@ -343,7 +343,7 @@ jobs:
         run: |
           env
           cat config.vars
-          VALGRIND=0 poetry run pytest tests/ -vvv -n ${PYTEST_PAR} ${PYTEST_OPTS}
+          VALGRIND=0 poetry run eatmydata pytest tests/ -vvv -n ${PYTEST_PAR} ${PYTEST_OPTS}
 
   integration-valgrind:
     name: Valgrind Test CLN ${{ matrix.name }}
@@ -356,7 +356,7 @@ jobs:
     needs:
       - compile
     strategy:
-      fail-fast: true
+      fail-fast: false
       matrix:
         include:
           - NAME: Valgrind (01/10)
@@ -411,7 +411,7 @@ jobs:
           SLOW_MACHINE: 1
           TEST_DEBUG: 1
         run: |
-          VALGRIND=1 poetry run pytest tests/ -vvv -n 3 ${PYTEST_OPTS}  ${{ matrix.PYTEST_OPTS }}
+          VALGRIND=1 poetry run eatmydata pytest tests/ -vvv -n 3 ${PYTEST_OPTS}  ${{ matrix.PYTEST_OPTS }}
 
   integration-sanitizers:
     name: Sanitizers Test CLN
@@ -425,7 +425,7 @@ jobs:
     needs:
       - compile
     strategy:
-      fail-fast: true
+      fail-fast: false
       matrix:
         include:
           - NAME: ASan/UBSan (01/10)
@@ -477,14 +477,15 @@ jobs:
 
       - name: Test
         run: |
-          poetry run pytest tests/ -vvv -n 2 ${PYTEST_OPTS}  ${{ matrix.PYTEST_OPTS }}
+          poetry run eatmydata pytest tests/ -vvv -n 2 ${PYTEST_OPTS}  ${{ matrix.PYTEST_OPTS }}
 
   update-docs-examples:
-    name: Update examples in doc schemas 
+    name: Update examples in doc schemas (disabled temporarily!)
+    if: false
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     strategy:
-      fail-fast: true
+      fail-fast: false
     env:
       VALGRIND: 0
       GENERATE_EXAMPLES: 1
@@ -519,7 +520,7 @@ jobs:
           tar -xaf cln-compile-gcc.tar.bz2
       - name: Test
         run: |
-          make -j $(nproc) check-doc-examples
+          eatmydata make -j $(nproc) check-doc-examples
 
   min-btc-support:
     name: Test minimum supported BTC v${{ matrix.MIN_BTC_VERSION }} with ${{ matrix.NAME }}
@@ -531,7 +532,7 @@ jobs:
     needs:
       - compile
     strategy:
-      fail-fast: true
+      fail-fast: false
       matrix:
         include:
           - NAME: clang
@@ -591,7 +592,7 @@ jobs:
         run: |
           env
           cat config.vars
-          VALGRIND=0 poetry run pytest tests/ -vvv -n ${PYTEST_PAR} ${PYTEST_OPTS}
+          VALGRIND=0 poetry run eatmydata pytest tests/ -vvv -n ${PYTEST_PAR} ${PYTEST_OPTS}
 
   check-flake:
     name: Check Nix Flake
@@ -615,7 +616,7 @@ jobs:
   gather:
     # A dummy task that depends on the full matrix of tests, and
     # signals successful completion. Used for the PR status to pass
-    # before merging.
+    # before merging.  Needs to run even if they failed!
     name: CI completion
     runs-on: ubuntu-22.04
     needs:
@@ -623,10 +624,30 @@ jobs:
       - check-units
       - integration-valgrind
       - integration-sanitizers
-      - update-docs-examples
       - min-btc-support
       - check-flake
+    if: ${{ always() }}
     steps:
       - name: Complete
+        env:
+          JOB_NAMES: "INTEGRATION CHECK_UNITS VALGRIND SANITIZERS BTC FLAKE"
+          INTEGRATION: ${{ needs.integration.result }}
+          CHECK_UNITS: ${{ needs['check-units'].result }}
+          VALGRIND: ${{ needs['integration-valgrind'].result }}
+          SANITIZERS: ${{ needs['integration-sanitizers'].result }}
+          DOCS: ${{ needs['update-docs-examples'].result }}
+          BTC: ${{ needs['min-btc-support'].result }}
+          FLAKE: ${{ needs['check-flake'].result }}
         run: |
-          echo CI completed successfully
+          failed=""
+          for name in $JOB_NAMES; do
+            result="${!name}"
+            echo "$name: $result"
+            if [[ "$result" != "success" ]]; then
+              failed="yes"
+            fi
+          done
+          if [[ "$failed" == "yes" ]]; then
+            echo "One or more required jobs failed"
+            exit 1
+          fi

@@ -142,6 +142,7 @@ service Node {
 	rpc InjectPaymentOnion(InjectpaymentonionRequest) returns (InjectpaymentonionResponse) {}
 	rpc InjectOnionMessage(InjectonionmessageRequest) returns (InjectonionmessageResponse) {}
 	rpc Xpay(XpayRequest) returns (XpayResponse) {}
+	rpc SignMessageWithKey(SignmessagewithkeyRequest) returns (SignmessagewithkeyResponse) {}
 
 	rpc SubscribeBlockAdded(StreamBlockAddedRequest) returns (stream BlockAddedNotification) {}
 	rpc SubscribeChannelOpenFailed(StreamChannelOpenFailedRequest) returns (stream ChannelOpenFailedNotification) {}
@@ -912,6 +913,7 @@ message SendonionRequest {
 	optional Amount amount_msat = 12;
 	optional bytes localinvreqid = 13;
 	optional string description = 14;
+	optional Amount total_amount_msat = 15;
 }
 
 message SendonionResponse {
@@ -3988,6 +3990,7 @@ message AskrenebiaschannelRequest {
 	string short_channel_id_dir = 2;
 	sint64 bias = 3;
 	optional string description = 4;
+	optional bool relative = 5;
 }
 
 message AskrenebiaschannelResponse {
@@ -4059,6 +4062,18 @@ message XpayResponse {
 	uint64 successful_parts = 3;
 	Amount amount_msat = 4;
 	Amount amount_sent_msat = 5;
+}
+
+message SignmessagewithkeyRequest {
+	string message = 1;
+	string address = 2;
+}
+
+message SignmessagewithkeyResponse {
+	string address = 1;
+	bytes pubkey = 2;
+	bytes signature = 3;
+	string base64 = 4;
 }
 
 message StreamBlockAddedRequest {
@@ -4140,7 +4155,7 @@ message ChannelStateChangedNotification {
 	bytes channel_id = 2;
 	string short_channel_id = 3;
 	string timestamp = 4;
-	ChannelState old_state = 5;
+	optional ChannelState old_state = 5;
 	ChannelState new_state = 6;
 	ChannelStateChangedCause cause = 7;
 	string message = 8;

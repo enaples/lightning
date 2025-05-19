@@ -40,6 +40,7 @@ bool initialized = false;
 /* Do we fail all preapprove requests? */
 bool dev_fail_preapprove = false;
 bool dev_no_preapprove_check = false;
+bool dev_warn_on_overgrind = false;
 
 struct hsmd_client *hsmd_client_new_main(const tal_t *ctx, u64 capabilities,
 					 void *extra)
@@ -135,6 +136,7 @@ bool hsmd_check_client_capabilities(struct hsmd_client *client,
 	case WIRE_HSMD_GET_CHANNEL_BASEPOINTS:
 	case WIRE_HSMD_DEV_MEMLEAK:
 	case WIRE_HSMD_SIGN_MESSAGE:
+	case WIRE_HSMD_BIP137_SIGN_MESSAGE:
 	case WIRE_HSMD_GET_OUTPUT_SCRIPTPUBKEY:
 	case WIRE_HSMD_SIGN_BOLT12:
 	case WIRE_HSMD_SIGN_BOLT12_2:
@@ -181,6 +183,7 @@ bool hsmd_check_client_capabilities(struct hsmd_client *client,
 	case WIRE_HSMD_GET_CHANNEL_BASEPOINTS_REPLY:
 	case WIRE_HSMD_DEV_MEMLEAK_REPLY:
 	case WIRE_HSMD_SIGN_MESSAGE_REPLY:
+	case WIRE_HSMD_BIP137_SIGN_MESSAGE_REPLY:
 	case WIRE_HSMD_GET_OUTPUT_SCRIPTPUBKEY_REPLY:
 	case WIRE_HSMD_SIGN_BOLT12_REPLY:
 	case WIRE_HSMD_SIGN_BOLT12_2_REPLY:
@@ -527,7 +530,7 @@ static void bitcoin_key(struct privkey *privkey, struct pubkey *pubkey,
 
 /* This gets the bitcoin private key needed to spend from our wallet */
 static void hsm_key_for_utxo(struct privkey *privkey, struct pubkey *pubkey,
-			     const struct utxo *utxo)
+			     const struct hsm_utxo *utxo)
 {
 	if (utxo->close_info != NULL) {
 		/* This is a their_unilateral_close/to-us output, so
@@ -545,14 +548,15 @@ static void hsm_key_for_utxo(struct privkey *privkey, struct pubkey *pubkey,
 
 /* Find our inputs by the pubkey associated with the inputs, and
  * add a partial sig for each */
-static void sign_our_inputs(struct utxo **utxos, struct wally_psbt *psbt)
+static void sign_our_inputs(struct hsm_utxo **utxos, struct wally_psbt *psbt)
 {
 	bool is_cache_enabled = false;
 	for (size_t i = 0; i < tal_count(utxos); i++) {
-		struct utxo *utxo = utxos[i];
+		struct hsm_utxo *utxo = utxos[i];
 		for (size_t j = 0; j < psbt->num_inputs; j++) {
 			struct privkey privkey;
 			struct pubkey pubkey;
+			bool needed_sig;
 
 			if (!wally_psbt_input_spends(&psbt->inputs[j],
 						   &utxo->outpoint))
@@ -590,6 +594,10 @@ static void sign_our_inputs(struct utxo **utxos, struct wally_psbt *psbt)
 				wally_psbt_signing_cache_enable(psbt, 0);
 				is_cache_enabled = true;
 			}
+
+			/* We watch for pre-taproot variable-length sigs */
+			needed_sig = (psbt->inputs[j].signatures.num_items == 0);
+
 			if (wally_psbt_sign(psbt, privkey.secret.data,
 					    sizeof(privkey.secret.data),
 					    EC_FLAG_GRIND_R) != WALLY_OK) {
@@ -601,6 +609,14 @@ static void sign_our_inputs(struct utxo **utxos, struct wally_psbt *psbt)
 				    "sign input %zu with key %s. PSBT: %s",
 				    j, fmt_pubkey(tmpctx, &pubkey),
 				    fmt_wally_psbt(tmpctx, psbt));
+			}
+			if (dev_warn_on_overgrind
+			    && needed_sig
+			    && psbt->inputs[j].signatures.num_items == 1
+			    && psbt->inputs[j].signatures.items[0].value_len < 71) {
+				hsmd_status_fmt(LOG_BROKEN, NULL,
+						"overgrind: short signature length %zu",
+						psbt->inputs[j].signatures.items[0].value_len);
 			}
 			tal_wally_end(psbt);
 		}
@@ -699,6 +715,51 @@ static u8 *handle_sign_message(struct hsmd_client *c, const u8 *msg_in)
 	}
 
 	return towire_hsmd_sign_message_reply(NULL, &rsig);
+}
+
+/* FIXME: implement BIP0322 signature scheme so that we can support any type of
+ * address. */
+/* Sign a message with a private key (see BIP137):
+ * signature = base64(SigRec(SHA256(SHA256(
+ *      "\x18Bitcoin Signed Message:\n" + var_int(len(message)) + message
+ *      )))) */
+static u8 *handle_bip137_sign_message(struct hsmd_client *c, const u8 *msg_in)
+{
+	u8 *msg;
+	u32 keyidx;
+	struct sha256_ctx sctx = SHA256_INIT;
+	struct sha256_double shad;
+	secp256k1_ecdsa_recoverable_signature rsig;
+	struct privkey privkey;
+	struct pubkey pubkey;
+
+	if (!fromwire_hsmd_bip137_sign_message(tmpctx, msg_in, &msg, &keyidx))
+		return hsmd_status_malformed_request(c, msg_in);
+
+	/* double sha256 the message */
+	const char header[] = "\x18"
+			      "Bitcoin Signed Message:\n";
+	sha256_update(&sctx, (const u8 *)header, strlen(header));
+
+	u8 vt[VARINT_MAX_LEN];
+	size_t msg_len = tal_count(msg);
+	size_t vtlen = varint_put(vt, msg_len);
+	sha256_update(&sctx, vt, vtlen);
+
+	sha256_update(&sctx, msg, msg_len);
+	sha256_double_done(&sctx, &shad);
+
+	/* get the private key BIP32 */
+	bitcoin_key(&privkey, &pubkey, keyidx);
+
+	if (!secp256k1_ecdsa_sign_recoverable(
+		secp256k1_ctx, &rsig, shad.sha.u.u8, privkey.secret.data, NULL,
+		NULL)) {
+		return hsmd_status_bad_request(c, msg_in,
+					       "Failed to sign message");
+	}
+
+	return towire_hsmd_bip137_sign_message_reply(NULL, &rsig);
 }
 
 /*~ lightningd asks us to sign a liquidity ad offer */
@@ -1315,11 +1376,11 @@ static u8 *handle_get_per_commitment_point(struct hsmd_client *c, const u8 *msg_
  * we can do more to check the previous case is valid. */
 static u8 *handle_sign_withdrawal_tx(struct hsmd_client *c, const u8 *msg_in)
 {
-	struct utxo **utxos;
+	struct hsm_utxo **utxos;
 	struct wally_psbt *psbt;
 
 	if (!fromwire_hsmd_sign_withdrawal(tmpctx, msg_in,
-					  &utxos, &psbt))
+					   &utxos, &psbt))
 		return hsmd_status_malformed_request(c, msg_in);
 
 	sign_our_inputs(utxos, psbt);
@@ -1584,7 +1645,7 @@ static u8 *handle_sign_remote_commitment_tx(struct hsmd_client *c, const u8 *msg
 	struct pubkey remote_per_commit;
 	bool option_static_remotekey;
 	u64 commit_num;
-	struct simple_htlc **htlc;
+	struct hsm_htlc *htlc;
 	u32 feerate;
 
 	if (!fromwire_hsmd_sign_remote_commitment_tx(tmpctx, msg_in,
@@ -1705,7 +1766,7 @@ static u8 *handle_sign_anchorspend(struct hsmd_client *c, const u8 *msg_in)
 {
 	struct node_id peer_id;
 	u64 dbid;
-	struct utxo **utxos;
+	struct hsm_utxo **utxos;
 	struct wally_psbt *psbt;
 	struct secret seed;
 	struct pubkey local_funding_pubkey;
@@ -1744,7 +1805,7 @@ static u8 *handle_sign_htlc_tx_mingle(struct hsmd_client *c, const u8 *msg_in)
 {
 	struct node_id peer_id;
 	u64 dbid;
-	struct utxo **utxos;
+	struct hsm_utxo **utxos;
 	struct wally_psbt *psbt;
 
 	/* FIXME: Check output goes to us. */
@@ -1820,7 +1881,7 @@ static u8 *handle_sign_commitment_tx(struct hsmd_client *c, const u8 *msg_in)
 static u8 *handle_validate_commitment_tx(struct hsmd_client *c, const u8 *msg_in)
 {
 	struct bitcoin_tx *tx;
-	struct simple_htlc **htlc;
+	struct hsm_htlc *htlc;
 	u64 commit_num;
 	u32 feerate;
 	struct bitcoin_signature sig;
@@ -2167,6 +2228,8 @@ u8 *hsmd_handle_client_message(const tal_t *ctx, struct hsmd_client *client,
 		return handle_preapprove_keysend(client, msg);
 	case WIRE_HSMD_SIGN_MESSAGE:
 		return handle_sign_message(client, msg);
+	case WIRE_HSMD_BIP137_SIGN_MESSAGE:
+		return handle_bip137_sign_message(client, msg);
 	case WIRE_HSMD_GET_CHANNEL_BASEPOINTS:
 		return handle_get_channel_basepoints(client, msg);
 	case WIRE_HSMD_CANNOUNCEMENT_SIG_REQ:
@@ -2249,6 +2312,7 @@ u8 *hsmd_handle_client_message(const tal_t *ctx, struct hsmd_client *client,
 	case WIRE_HSMD_GET_CHANNEL_BASEPOINTS_REPLY:
 	case WIRE_HSMD_DEV_MEMLEAK_REPLY:
 	case WIRE_HSMD_SIGN_MESSAGE_REPLY:
+	case WIRE_HSMD_BIP137_SIGN_MESSAGE_REPLY:
 	case WIRE_HSMD_GET_OUTPUT_SCRIPTPUBKEY_REPLY:
 	case WIRE_HSMD_SIGN_BOLT12_REPLY:
 	case WIRE_HSMD_SIGN_BOLT12_2_REPLY:
@@ -2283,10 +2347,9 @@ u8 *hsmd_init(struct secret hsm_secret, const u64 hsmd_version,
 		WIRE_HSMD_FORGET_CHANNEL,
 		WIRE_HSMD_REVOKE_COMMITMENT_TX,
 		WIRE_HSMD_SIGN_BOLT12_2,
-		WIRE_HSMD_PREAPPROVE_INVOICE_CHECK,
-		WIRE_HSMD_PREAPPROVE_KEYSEND_CHECK,
+		WIRE_HSMD_BIP137_SIGN_MESSAGE,
 	};
-	const u32 *caps;
+	u32 *caps;
 
 	/*~ Don't swap this. */
 	sodium_mlock(secretstuff.hsm_secret.data,
@@ -2409,14 +2472,11 @@ u8 *hsmd_init(struct secret hsm_secret, const u64 hsmd_version,
 		    "derived secrets", strlen("derived secrets"));
 
 	/* Capabilities arg needs to be a tal array */
-	if (dev_no_preapprove_check) {
-		/* Skip preapprove capabilities */
-		caps = tal_dup_arr(tmpctx, u32,
-				   capabilities, ARRAY_SIZE(capabilities) - 2,
-				   0);
-	} else {
-		caps = tal_dup_arr(tmpctx, u32,
-				   capabilities, ARRAY_SIZE(capabilities), 0);
+	caps =
+	    tal_dup_arr(tmpctx, u32, capabilities, ARRAY_SIZE(capabilities), 0);
+	if (!dev_no_preapprove_check) {
+		tal_arr_expand(&caps, WIRE_HSMD_PREAPPROVE_INVOICE_CHECK);
+		tal_arr_expand(&caps, WIRE_HSMD_PREAPPROVE_KEYSEND_CHECK);
 	}
 
 	/*~ Note: marshalling a bip32 tree only marshals the public side,

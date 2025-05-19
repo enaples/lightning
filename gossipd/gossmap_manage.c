@@ -6,6 +6,7 @@
 #include <common/daemon_conn.h>
 #include <common/gossip_store.h>
 #include <common/gossmap.h>
+#include <common/memleak.h>
 #include <common/status.h>
 #include <common/timeout.h>
 #include <common/wire_error.h>
@@ -469,6 +470,13 @@ static bool setup_gossmap(struct gossmap_manage *gm,
 	return true;
 }
 
+void gossmap_manage_memleak(struct htable *memtable,
+			    const struct gossmap_manage *gm)
+{
+	memleak_scan_uintmap(memtable, &gm->pending_ann_map.map);
+	memleak_scan_uintmap(memtable, &gm->early_ann_map.map);
+}
+
 struct gossmap_manage *gossmap_manage_new(const tal_t *ctx,
 					  struct daemon *daemon)
 {
@@ -824,9 +832,11 @@ static const char *process_channel_update(const tal_t *ctx,
 		u32 prev_timestamp
 			= gossip_store_get_timestamp(gm->gs, chan->cupdate_off[dir]);
 		if (prev_timestamp >= timestamp) {
-			status_trace("Too-old update for %s",
-				     fmt_short_channel_id(tmpctx, scid));
-			/* Too old, ignore */
+			/* Don't spam the logs for duplicates! */
+			if (timestamp < prev_timestamp)
+				status_trace("Too-old update for %s",
+					     fmt_short_channel_id(tmpctx, scid));
+			/* Too old / redundant, ignore */
 			return NULL;
 		}
 	} else {

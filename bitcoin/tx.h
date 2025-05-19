@@ -48,6 +48,17 @@ struct bitcoin_tx_output {
 	u8 *script;
 };
 
+enum utxotype {
+	/* Obsolete: we used to have P2SH-wrapped outputs (removed in 24.02, though can still have old UTXOs) */
+	UTXO_P2SH_P2WPKH = 1,
+	/* "bech32" addresses */
+	UTXO_P2WPKH = 2,
+	/* Used for closing addresses: implies ->close_info is non-NULL */
+	UTXO_P2WSH_FROM_CLOSE = 3,
+	/* "p2tr" addresses. */
+	UTXO_P2TR = 4,
+};
+
 struct bitcoin_tx_output *new_tx_output(const tal_t *ctx,
 					struct amount_sat amount,
 					const u8 *script);
@@ -100,7 +111,8 @@ bool bitcoin_txid_to_hex(const struct bitcoin_txid *txid,
 			 char *hexstr, size_t hexstr_len);
 
 /* Create a bitcoin_tx from a psbt */
-struct bitcoin_tx *bitcoin_tx_with_psbt(const tal_t *ctx, struct wally_psbt *psbt);
+struct bitcoin_tx *bitcoin_tx_with_psbt(const tal_t *ctx,
+					struct wally_psbt *psbt TAKES);
 
 /* Internal de-linearization functions. */
 /* Pull a bitcoin tx, and create a PSBT wrapper for it */
@@ -315,14 +327,13 @@ size_t bitcoin_tx_output_weight(size_t outscript_len);
 /* Weight to push sig on stack. */
 size_t bitcoin_tx_input_sig_weight(void);
 
-/* Segwit input, but with parameter for witness weight (size) */
+/* Segwit input, but with parameter for witness weight (size).
+ * witness_weight must include the varint_size() for each witness element,
+ * but not the varint_size() for the number of elements. */
 size_t bitcoin_tx_input_weight(bool p2sh, size_t witness_weight);
 
-/* The witness weight for a simple (sig + key) input */
-size_t bitcoin_tx_simple_input_witness_weight(void);
-
-/* We only do segwit inputs, and we assume witness is sig + key  */
-size_t bitcoin_tx_simple_input_weight(bool p2sh);
+/* The witness weight */
+size_t bitcoin_tx_input_witness_weight(enum utxotype utxotype);
 
 /* The witness for our 2of2 input (closing or commitment tx). */
 size_t bitcoin_tx_2of2_input_witness_weight(void);

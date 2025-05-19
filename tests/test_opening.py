@@ -577,10 +577,6 @@ def test_v2_rbf_liquidity_ad(node_factory, bitcoind, chainparams):
 
     l1, l2 = node_factory.get_nodes(2, opts=opts)
 
-    # Other plugins use datastore, but we want to make sure our own
-    # data is cleared!
-    empty_datastore = l1.rpc.listdatastore()
-
     # what happens when we RBF?
     feerate = 2000
     amount = 500000
@@ -637,7 +633,7 @@ def test_v2_rbf_liquidity_ad(node_factory, bitcoind, chainparams):
     l1.rpc.openchannel_signed(chan_id, signed_psbt)
 
     # There's data in the datastore now (l2 only)
-    assert l1.rpc.listdatastore() == empty_datastore
+    assert l1.rpc.listdatastore(['funder']) == {'datastore': []}
     only_one(l2.rpc.listdatastore("funder/{}".format(chan_id))['datastore'])
 
     # what happens when the channel opens?
@@ -645,8 +641,8 @@ def test_v2_rbf_liquidity_ad(node_factory, bitcoind, chainparams):
     l1.daemon.wait_for_log('to CHANNELD_NORMAL')
 
     # Datastore should be cleaned up!
-    assert l1.rpc.listdatastore() == empty_datastore
-    wait_for(lambda: l2.rpc.listdatastore() == empty_datastore)
+    assert l1.rpc.listdatastore(['funder']) == {'datastore': []}
+    wait_for(lambda: l2.rpc.listdatastore(['funder']) == {'datastore': []})
 
     # This should be the accepter's amount
     fundings = only_one(l1.rpc.listpeerchannels()['channels'])['funding']
@@ -921,6 +917,8 @@ def test_rbf_reconnect_tx_construct(node_factory, bitcoind, chainparams):
     # abort doesn't cause a disconnect
     assert l1.rpc.getpeer(l2.info['id'])['connected']
 
+    log_after_connect = l1.daemon.logsearch_start
+
     # The next TX_COMPLETE break (both remember) + they break on the
     # COMMITMENT_SIGNED during the reconnect
     bump = l1.rpc.openchannel_bump(chan_id, chan_amount, initpsbt['psbt'])
@@ -945,12 +943,16 @@ def test_rbf_reconnect_tx_construct(node_factory, bitcoind, chainparams):
     l2.daemon.wait_for_logs([r'Got dualopend reestablish',
                              r'No commitment, not sending our sigs',
                              # This is a BROKEN log, it's expected!
-                             r'dualopend daemon died before signed PSBT returned|dualopend: Owning subdaemon dualopend died'])
+                             r'dualopend daemon died before signed PSBT returned|dualopend: Owning subdaemon dualopend died',
+                             r'Owning subdaemon dualopend died'])
 
-    # We don't have the commtiments yet, there's no scratch_txid
+    # If we received their commitment_signed first, we *will* have scratch!
     inflights = only_one(l1.rpc.listpeerchannels()['channels'])['inflight']
     assert len(inflights) == 2
-    assert 'scratch_txid' not in inflights[1]
+    if l1.daemon.is_in_log('peer_in WIRE_COMMITMENT_SIGNED', start=log_after_connect):
+        assert 'scratch_txid' in inflights[1]
+    else:
+        assert 'scratch_txid' not in inflights[1]
 
     # After reconnecting, we have a scratch txid!
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
@@ -1054,14 +1056,13 @@ def test_rbf_reconnect_tx_sigs(node_factory, bitcoind, chainparams):
 @unittest.skipIf(TEST_NETWORK != 'regtest', 'elementsd doesnt yet support PSBT features we need')
 @pytest.mark.openchannel('v2')
 def test_rbf_to_chain_before_commit(node_factory, bitcoind, chainparams):
-    disconnects = ['=WIRE_TX_ADD_INPUT',  # Initial funding succeeds
-                   '=WIRE_COMMITMENT_SIGNED',
+    disconnects = ['=WIRE_COMMITMENT_SIGNED',
                    '-WIRE_COMMITMENT_SIGNED']
     l1, l2 = node_factory.get_nodes(2,
-                                    opts=[{'disconnect': disconnects,
-                                           'may_reconnect': True,
+                                    opts=[{'may_reconnect': True,
                                            'dev-no-reconnect': None},
-                                          {'may_reconnect': True,
+                                          {'disconnect': disconnects,
+                                           'may_reconnect': True,
                                            'dev-no-reconnect': None}])
 
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
@@ -1526,7 +1527,7 @@ def test_funder_contribution_limits(node_factory, bitcoind):
 
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
     l1.fundchannel(l2, 10**7)
-    assert l2.daemon.is_in_log('Policy .* returned funding amount of 107530sat')
+    assert l2.daemon.is_in_log('Policy .* returned funding amount of 107470sat')
     assert l2.daemon.is_in_log(r'calling `signpsbt` .* inputs')
 
     l1.rpc.connect(l3.info['id'], 'localhost', l3.port)
@@ -1862,7 +1863,8 @@ def test_v2_replay_bookkeeping(node_factory, bitcoind):
 
     opts = [{'funder-policy': 'match', 'funder-policy-mod': 100,
              'lease-fee-base-sat': '100sat', 'lease-fee-basis': 100,
-             'rescan': 10, 'funding-confirms': 6, 'may_reconnect': True},
+             'rescan': 10, 'funding-confirms': 6, 'may_reconnect': True,
+             'broken_log': 'channeld.*current blockheight [0-9]* less than last'},
             {'funder-policy': 'match', 'funder-policy-mod': 100,
              'lease-fee-base-sat': '100sat', 'lease-fee-basis': 100,
              'may_reconnect': True}]
@@ -1923,7 +1925,8 @@ def test_buy_liquidity_ad_check_bookkeeping(node_factory, bitcoind):
     opts = [{'funder-policy': 'match', 'funder-policy-mod': 100,
              'lease-fee-base-sat': '100sat', 'lease-fee-basis': 100,
              'rescan': 10, 'disable-plugin': 'bookkeeper',
-             'funding-confirms': 6, 'may_reconnect': True},
+             'funding-confirms': 6, 'may_reconnect': True,
+             'broken_log': 'channeld.*current blockheight [0-9]* less than last'},
             {'funder-policy': 'match', 'funder-policy-mod': 100,
              'lease-fee-base-sat': '100sat', 'lease-fee-basis': 100,
              'may_reconnect': True}]
@@ -2717,11 +2720,14 @@ def test_zeroconf_forget(node_factory, bitcoind, dopay: bool):
         return {"id": tx["id"], "result": {}}
 
     l1.daemon.rpcproxy.mock_rpc("sendrawtransaction", censoring_sendrawtx)
+    l3.daemon.rpcproxy.mock_rpc("sendrawtransaction", censoring_sendrawtx)
+
+    l1.fundwallet(10**7)
+    l3.fundwallet(10**7)
+    sync_blockheight(bitcoind, [l2])
 
     l1.connect(l2)
-    l1.fundwallet(10**7)
     l1.rpc.fundchannel(l2.info["id"], 10**6, mindepth=0)
-    sync_blockheight(bitcoind, [l1, l2])
     wait_for(lambda: l2.rpc.listincoming()["incoming"] != [])
 
     # If we are told to pay while still not confirmed we perform one
@@ -2734,16 +2740,19 @@ def test_zeroconf_forget(node_factory, bitcoind, dopay: bool):
         l1.rpc.pay(inv["bolt11"])
         wait_for(lambda: only_one(l2.rpc.listpeerchannels()['channels'])['to_us_msat'] == 1)
 
-    # We need *another* channel to make it forget the first though!
+    # We need *another* channel to make it forget the first though!  (One block later, otherwise
+    # *this* might be forgotten).
+    bitcoind.generate_block(1)
+    sync_blockheight(bitcoind, [l2])
+
     l3.connect(l2)
-    l3.fundwallet(10**7)
     l3.rpc.fundchannel(l2.info["id"], 10**6, mindepth=0)
     bitcoind.generate_block(1)
 
     # Now stop, in order to cause catchup and re-evaluate whether to forget the channel
     l2.stop()
 
-    # Now we generate enough blocks to cause l2 to forget the channel.
+    # Now we generate enough blocks to cause l2 consider both channels forgettable.
     bitcoind.generate_block(blocks - 1)  # > blocks
     l2.start()
 
@@ -2754,16 +2763,14 @@ def test_zeroconf_forget(node_factory, bitcoind, dopay: bool):
     bitcoind.generate_block(1)
     sync_blockheight(bitcoind, [l1, l2])
 
-    # This may take a moment!
-    time.sleep(5)
-
-    have_forgotten = l2.daemon.is_in_log(
-        r"UNUSUAL {}-chan#1: Forgetting channel: It has been 51 blocks without the funding transaction ".format(l1.info['id'])
-    )
-
+    # If we made a payment it will *not* consider there to tbe two forgettable channels.
     if dopay:
-        assert not have_forgotten
+        # This may take a moment!
+        time.sleep(5)
+
+        assert not l2.daemon.is_in_log('Forgetting channel')
         assert set([c['peer_id'] for c in l2.rpc.listpeerchannels()["channels"]]) == set([l1.info['id'], l3.info['id']])
     else:
-        assert have_forgotten
+        # It will forget the older one.
+        l2.daemon.wait_for_log(r"UNUSUAL {}-chan#1: Forgetting channel: It has been {} blocks without the funding transaction ".format(l1.info['id'], blocks + 1))
         assert [c['peer_id'] for c in l2.rpc.listpeerchannels()["channels"]] == [l3.info['id']]

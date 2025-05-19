@@ -374,9 +374,6 @@ bool fromwire_tlv(const u8 **cursor UNNEEDED, size_t *max UNNEEDED,
 		  void *record UNNEEDED, struct tlv_field **fields UNNEEDED,
 		  const u64 *extra_types UNNEEDED, size_t *err_off UNNEEDED, u64 *err_type UNNEEDED)
 { fprintf(stderr, "fromwire_tlv called!\n"); abort(); }
-/* Generated stub for get_block_height */
-u32 get_block_height(const struct chain_topology *topo UNNEEDED)
-{ fprintf(stderr, "get_block_height called!\n"); abort(); }
 /* Generated stub for get_network_blockheight */
 u32 get_network_blockheight(const struct chain_topology *topo UNNEEDED)
 { fprintf(stderr, "get_network_blockheight called!\n"); abort(); }
@@ -1310,6 +1307,12 @@ void txfilter_add_scriptpubkey(struct txfilter *filter UNNEEDED, const u8 *scrip
 		tal_free(script);
 }
 
+/* Can actually be called by new_channel */
+u32 get_block_height(const struct chain_topology *topo UNNEEDED)
+{
+	return 0;
+}
+
 /**
  * mempat -- Set the memory to a pattern
  *
@@ -1387,12 +1390,12 @@ static bool test_wallet_outputs(struct lightningd *ld, const tal_t *ctx)
 	db_begin_transaction(w->db);
 
 	/* Should work, it's the first time we add it */
-	CHECK_MSG(wallet_add_utxo(w, &u, p2sh_wpkh),
+	CHECK_MSG(wallet_add_utxo(w, &u, WALLET_OUTPUT_P2SH_WPKH),
 		  "wallet_add_utxo failed on first add");
 	CHECK_MSG(!wallet_err, wallet_err);
 
 	/* Should fail, we already have that UTXO */
-	CHECK_MSG(!wallet_add_utxo(w, &u, p2sh_wpkh),
+	CHECK_MSG(!wallet_add_utxo(w, &u, WALLET_OUTPUT_P2SH_WPKH),
 		  "wallet_add_utxo succeeded on second add");
 	CHECK_MSG(!wallet_err, wallet_err);
 
@@ -1403,10 +1406,12 @@ static bool test_wallet_outputs(struct lightningd *ld, const tal_t *ctx)
 	u.close_info->peer_id = id;
 	u.close_info->commitment_point = &pk;
 	u.close_info->option_anchors = false;
-	/* Arbitrarily set scriptpubkey len to 20 */
-	u.scriptPubkey = tal_arr(w, u8, 20);
-	memset(u.scriptPubkey, 1, 20);
-	CHECK_MSG(wallet_add_utxo(w, &u, our_change),
+	/* P2WSH */
+	u.scriptPubkey = tal_arr(w, u8, BITCOIN_SCRIPTPUBKEY_P2WSH_LEN);
+	u.scriptPubkey[0] = OP_0;
+	u.scriptPubkey[1] = sizeof(struct sha256);
+	memset(u.scriptPubkey + 2, 1, sizeof(struct sha256));
+	CHECK_MSG(wallet_add_utxo(w, &u, WALLET_OUTPUT_OUR_CHANGE),
 		  "wallet_add_utxo with close_info");
 
 	/* Now select them */
@@ -1473,9 +1478,11 @@ static bool test_wallet_outputs(struct lightningd *ld, const tal_t *ctx)
 	CHECK_MSG(!wallet_err, wallet_err);
 
 	u.blockheight = blockheight;
-	u.scriptPubkey = tal_arr(w, u8, 20);
-	memset(u.scriptPubkey, 1, 20);
-	CHECK_MSG(wallet_add_utxo(w, &u, p2sh_wpkh),
+	u.scriptPubkey = tal_arr(w, u8, BITCOIN_SCRIPTPUBKEY_P2WPKH_LEN);
+	u.scriptPubkey[0] = OP_0;
+	u.scriptPubkey[1] = sizeof(struct ripemd160);
+	memset(u.scriptPubkey + 2, 1, sizeof(struct ripemd160));
+	CHECK_MSG(wallet_add_utxo(w, &u, WALLET_OUTPUT_P2SH_WPKH),
 		  "wallet_add_utxo with close_info no commitment_point");
 	CHECK_MSG(!wallet_err, wallet_err);
 
@@ -1557,7 +1564,7 @@ static bool test_wallet_outputs(struct lightningd *ld, const tal_t *ctx)
 	memset(&u.outpoint, 4, sizeof(u.outpoint));
 	u.amount = AMOUNT_SAT(4);
 	u.close_info = tal_free(u.close_info);
-	CHECK_MSG(wallet_add_utxo(w, &u, p2wpkh),
+	CHECK_MSG(wallet_add_utxo(w, &u, WALLET_OUTPUT_P2WPKH),
 		  "wallet_add_utxo failed, p2wpkh");
 
 	utxos = tal_arr(w, const struct utxo *, 0);
@@ -1648,6 +1655,11 @@ static bool channel_inflightseq(struct channel_inflight *i1,
 	CHECK(i1->lease_chan_max_msat == i2->lease_chan_max_msat);
 	CHECK(i1->lease_chan_max_ppt == i2->lease_chan_max_ppt);
 	CHECK(i1->lease_blockheight_start == i2->lease_blockheight_start);
+	CHECK(!i1->locked_scid == !i2->locked_scid);
+	if (i1->locked_scid)
+		CHECK(memeq(i1->locked_scid, sizeof(*i1->locked_scid),
+			    i2->locked_scid, sizeof(*i2->locked_scid)));
+	CHECK(i1->splice_locked_memonly == i2->splice_locked_memonly);
 
 	return true;
 }
@@ -2069,6 +2081,9 @@ static bool test_channel_inflight_crud(struct lightningd *ld, const tal_t *ctx)
 				0,
 				false,
 				false);
+	inflight->splice_locked_memonly = true;
+	inflight->locked_scid = tal(inflight, struct short_channel_id);
+	memset(inflight->locked_scid, 7, sizeof(struct short_channel_id));
 
 	inflight_set_last_tx(inflight, last_tx, sig);
 
@@ -2096,6 +2111,8 @@ static bool test_channel_inflight_crud(struct lightningd *ld, const tal_t *ctx)
 				0,
 				false,
 				false);
+	inflight->splice_locked_memonly = false;
+	inflight->locked_scid = NULL;
 	inflight_set_last_tx(inflight, last_tx, sig);
 	wallet_inflight_add(w, inflight);
 	CHECK_MSG(c2 = wallet_channel_load(w, chan->dbid),

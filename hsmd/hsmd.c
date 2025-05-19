@@ -442,8 +442,11 @@ static struct io_plan *preinit_hsm(struct io_conn *conn,
 	if (tlv->no_preapprove_check)
 		dev_no_preapprove_check = *tlv->no_preapprove_check;
 
-	status_debug("preinit: dev_fail_preapprove = %u, dev_no_preapprove_check = %u",
-		     dev_fail_preapprove, dev_no_preapprove_check);
+	if (tlv->warn_on_overgrind)
+		dev_warn_on_overgrind = *tlv->warn_on_overgrind;
+
+	status_debug("preinit: dev_fail_preapprove = %u, dev_no_preapprove_check = %u, dev_warn_on_overgrind = %u",
+		     dev_fail_preapprove, dev_no_preapprove_check, dev_warn_on_overgrind);
 	/* We don't send a reply, just read next */
 	return client_read_next(conn, c);
 }
@@ -689,6 +692,7 @@ static struct io_plan *handle_client(struct io_conn *conn, struct client *c)
 	case WIRE_HSMD_GET_CHANNEL_BASEPOINTS:
 	case WIRE_HSMD_SIGN_INVOICE:
 	case WIRE_HSMD_SIGN_MESSAGE:
+	case WIRE_HSMD_BIP137_SIGN_MESSAGE:
 	case WIRE_HSMD_SIGN_OPTION_WILL_FUND_OFFER:
 	case WIRE_HSMD_SIGN_BOLT12:
 	case WIRE_HSMD_SIGN_BOLT12_2:
@@ -745,6 +749,7 @@ static struct io_plan *handle_client(struct io_conn *conn, struct client *c)
 	case WIRE_HSMD_GET_CHANNEL_BASEPOINTS_REPLY:
 	case WIRE_HSMD_DEV_MEMLEAK_REPLY:
 	case WIRE_HSMD_SIGN_MESSAGE_REPLY:
+	case WIRE_HSMD_BIP137_SIGN_MESSAGE_REPLY:
 	case WIRE_HSMD_GET_OUTPUT_SCRIPTPUBKEY_REPLY:
 	case WIRE_HSMD_SIGN_BOLT12_REPLY:
 	case WIRE_HSMD_SIGN_BOLT12_2_REPLY:

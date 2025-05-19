@@ -1211,6 +1211,8 @@ def generate_utils_examples(l1, l2, l3, l4, l5, l6, c23_2, c34_2, inv_l11, inv_l
         update_example(node=l2, method='signmessage', params={'message': 'message for you'})
         update_example(node=l2, method='checkmessage', params={'message': 'testcase to check new rpc error', 'zbase': 'd66bqz3qsku5fxtqsi37j11pci47ydxa95iusphutggz9ezaxt56neh77kxe5hyr41kwgkncgiu94p9ecxiexgpgsz8daoq4tw8kj8yx', 'pubkey': '03be3b0e9992153b1d5a6e1623670b6c3663f72ce6cf2e0dd39c0a373a7de5a3b7'})
         update_example(node=l2, method='checkmessage', params={'message': 'this is a test!', 'zbase': 'd6tqaeuonjhi98mmont9m4wag7gg4krg1f4txonug3h31e9h6p6k6nbwjondnj46dkyausobstnk7fhyy998bhgc1yr98dfmhb4k54d7'})
+        addr = l2.rpc.newaddr('bech32')['bech32']
+        update_example(node=l2, method='signmessagewithkey', params={'message': 'a test message', 'address': addr})
         decodepay_res1 = update_example(node=l2, method='decodepay', params={'bolt11': inv_l11['bolt11']})
         update_example(node=l2, method='decode', params=[rune_l21['rune']])
         decode_res2 = update_example(node=l2, method='decode', params=[inv_l22['bolt11']])
@@ -1914,7 +1916,7 @@ def generate_list_examples(l1, l2, l3, c12, c23_2, inv_l31, inv_l32, offer_l23, 
                 output['amount_msat'] = 201998900000 + (i * 1000) + (k * 100)
         update_example(node=l1, method='listtransactions', params={}, response=listtransactions_res1)
         listclosedchannels_res1 = l2.rpc.listclosedchannels()
-        listclosedchannels_res1 = update_list_responses(listclosedchannels_res1, list_key='closedchannels')
+        listclosedchannels_res1 = update_list_responses(listclosedchannels_res1, list_key='closedchannels', slice_upto=2, update_func=None, sort=True, sort_key='channel_id')
         for i, closedchannel in enumerate(listclosedchannels_res1['closedchannels'], start=1):
             closedchannel['last_commitment_fee_msat'] = 2894000 + (i * 1000)
             closedchannel['last_commitment_txid'] = 'txidcloselastcommitment0' + (('0000' + str(i)) * 8)

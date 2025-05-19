@@ -4320,6 +4320,18 @@ impl From<responses::XpayResponse> for pb::XpayResponse {
 }
 
 #[allow(unused_variables)]
+impl From<responses::SignmessagewithkeyResponse> for pb::SignmessagewithkeyResponse {
+    fn from(c: responses::SignmessagewithkeyResponse) -> Self {
+        Self {
+            address: c.address, // Rule #2 for type string
+            base64: c.base64, // Rule #2 for type string
+            pubkey: c.pubkey.serialize().to_vec(), // Rule #2 for type pubkey
+            signature: hex::decode(&c.signature).unwrap(), // Rule #2 for type hex
+        }
+    }
+}
+
+#[allow(unused_variables)]
 impl From<notifications::BlockAddedNotification> for pb::BlockAddedNotification {
     fn from(c: notifications::BlockAddedNotification) -> Self {
         Self {
@@ -4391,7 +4403,7 @@ impl From<notifications::ChannelStateChangedNotification> for pb::ChannelStateCh
             channel_id: <Sha256 as AsRef<[u8]>>::as_ref(&c.channel_id).to_vec(), // Rule #2 for type hash
             message: c.message, // Rule #2 for type string
             new_state: c.new_state as i32,
-            old_state: c.old_state as i32,
+            old_state: c.old_state.map(|v| v as i32),
             peer_id: c.peer_id.serialize().to_vec(), // Rule #2 for type pubkey
             short_channel_id: c.short_channel_id.to_string(), // Rule #2 for type short_channel_id
             timestamp: c.timestamp, // Rule #2 for type string
@@ -4789,6 +4801,7 @@ impl From<requests::SendonionRequest> for pb::SendonionRequest {
             payment_hash: <Sha256 as AsRef<[u8]>>::as_ref(&c.payment_hash).to_vec(), // Rule #2 for type hash
             // Field: SendOnion.shared_secrets[]
             shared_secrets: c.shared_secrets.map(|arr| arr.into_iter().map(|i| i.to_vec()).collect()).unwrap_or(vec![]), // Rule #3
+            total_amount_msat: c.total_amount_msat.map(|f| f.into()), // Rule #2 for type msat?
         }
     }
 }
@@ -5990,6 +6003,7 @@ impl From<requests::AskrenebiaschannelRequest> for pb::AskrenebiaschannelRequest
             bias: c.bias, // Rule #2 for type integer
             description: c.description, // Rule #2 for type string?
             layer: c.layer, // Rule #2 for type string
+            relative: c.relative, // Rule #2 for type boolean?
             short_channel_id_dir: c.short_channel_id_dir.to_string(), // Rule #2 for type short_channel_id_dir
         }
     }
@@ -6043,6 +6057,16 @@ impl From<requests::XpayRequest> for pb::XpayRequest {
             maxfee: c.maxfee.map(|f| f.into()), // Rule #2 for type msat?
             partial_msat: c.partial_msat.map(|f| f.into()), // Rule #2 for type msat?
             retry_for: c.retry_for, // Rule #2 for type u32?
+        }
+    }
+}
+
+#[allow(unused_variables)]
+impl From<requests::SignmessagewithkeyRequest> for pb::SignmessagewithkeyRequest {
+    fn from(c: requests::SignmessagewithkeyRequest) -> Self {
+        Self {
+            address: c.address, // Rule #2 for type string
+            message: c.message, // Rule #2 for type string
         }
     }
 }
@@ -6475,6 +6499,7 @@ impl From<pb::SendonionRequest> for requests::SendonionRequest {
             partid: c.partid.map(|v| v as u16), // Rule #1 for type u16?
             payment_hash: Sha256::from_slice(&c.payment_hash).unwrap(), // Rule #1 for type hash
             shared_secrets: Some(c.shared_secrets.into_iter().map(|s| s.try_into().unwrap()).collect()), // Rule #4
+            total_amount_msat: c.total_amount_msat.map(|a| a.into()), // Rule #1 for type msat?
         }
     }
 }
@@ -7654,6 +7679,7 @@ impl From<pb::AskrenebiaschannelRequest> for requests::AskrenebiaschannelRequest
             bias: c.bias, // Rule #1 for type integer
             description: c.description, // Rule #1 for type string?
             layer: c.layer, // Rule #1 for type string
+            relative: c.relative, // Rule #1 for type boolean?
             short_channel_id_dir: cln_rpc::primitives::ShortChannelIdDir::from_str(&c.short_channel_id_dir).unwrap(), // Rule #1 for type short_channel_id_dir
         }
     }
@@ -7706,6 +7732,16 @@ impl From<pb::XpayRequest> for requests::XpayRequest {
             maxfee: c.maxfee.map(|a| a.into()), // Rule #1 for type msat?
             partial_msat: c.partial_msat.map(|a| a.into()), // Rule #1 for type msat?
             retry_for: c.retry_for, // Rule #1 for type u32?
+        }
+    }
+}
+
+#[allow(unused_variables)]
+impl From<pb::SignmessagewithkeyRequest> for requests::SignmessagewithkeyRequest {
+    fn from(c: pb::SignmessagewithkeyRequest) -> Self {
+        Self {
+            address: c.address, // Rule #1 for type string
+            message: c.message, // Rule #1 for type string
         }
     }
 }

@@ -929,7 +929,7 @@ struct command_result *jsonrpc_set_datastore_(struct command *cmd,
 	struct out_req *req;
 
 	if (!cb)
-		cb = ignore_cb;
+		cb = ignore_and_complete;
 	if (!errcb)
 		errcb = plugin_broken_cb;
 
@@ -1835,9 +1835,11 @@ void plugin_logv(struct plugin *p, enum log_level l,
 
 	json_object_start(js, "params");
 	json_add_string(js, "level",
-			l == LOG_DBG ? "debug"
+			l == LOG_TRACE ? "trace"
+			: l == LOG_DBG ? "debug"
 			: l == LOG_INFORM ? "info"
 			: l == LOG_UNUSUAL ? "warn"
+			: l == LOG_TRACE ? "trace"
 			: "error");
 	json_out_addv(js->jout, "message", true, fmt, ap);
 	json_object_end(js);

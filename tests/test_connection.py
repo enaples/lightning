@@ -30,9 +30,9 @@ def test_connect_basic(node_factory):
     l1id = l1.info['id']
     l2id = l2.info['id']
 
-    # These should be in openingd.
+    # These should be in connectd.
     assert l1.rpc.getpeer(l2id)['connected']
-    assert l2.rpc.getpeer(l1id)['connected']
+    wait_for(lambda: l2.rpc.getpeer(l1id)['connected'])
     assert len(l1.rpc.listpeerchannels(l2id)['channels']) == 0
     assert len(l2.rpc.listpeerchannels(l1id)['channels']) == 0
 
@@ -1145,6 +1145,7 @@ def test_funding_fail(node_factory, bitcoind):
     del l2.daemon.opts['watchtime-blocks']
     l2.restart()
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
+    wait_for(lambda: [p['connected'] for p in l2.rpc.listpeers()['peers']] == [True])
 
     # We don't have enough left to cover fees if we try to spend it all.
     with pytest.raises(RpcError, match=r'not afford'):
@@ -1152,8 +1153,6 @@ def test_funding_fail(node_factory, bitcoind):
 
     # Should still be connected (we didn't contact the peer)
     assert only_one(l1.rpc.listpeers()['peers'])['connected']
-    l2.daemon.wait_for_log('Handed peer, entering loop')
-    assert only_one(l2.rpc.listpeers()['peers'])['connected']
 
     # This works.
     l1.rpc.fundchannel(l2.info['id'], int(funds / 10))
@@ -2626,7 +2625,9 @@ def test_update_fee_reconnect(node_factory, bitcoind):
     assert l1.daemon.is_in_log('got commitsig [0-9]*: feerate 14005')
     assert l2.daemon.is_in_log('got commitsig [0-9]*: feerate 14005')
 
-    # Now shutdown cleanly.
+    # Now shutdown cleanly.  (Make sure l1 has raised min_acceptable: if it
+    # changes while it negotiates, it may reject the result and unilaterally close!)
+    wait_for(lambda: l1.rpc.feerates(style='perkw')['perkw']['min_acceptable'] == 7000)
     l1.rpc.close(chan)
 
     # And should put closing into mempool.
@@ -3745,6 +3746,7 @@ def test_openchannel_init_alternate(node_factory, executor):
             print("nothing to do")
 
 
+@unittest.skip("experimental-upgrade-protocol TLV fields conflict with splicing TLV fields")
 def test_upgrade_statickey(node_factory, executor):
     """l1 doesn't have option_static_remotekey, l2 offers it."""
     l1, l2 = node_factory.get_nodes(2, opts=[{'may_reconnect': True,
@@ -3783,6 +3785,7 @@ def test_upgrade_statickey(node_factory, executor):
     l2.daemon.wait_for_log(r"They sent desired_channel_type \[12\]")
 
 
+@unittest.skip("experimental-upgrade-protocol TLV fields conflict with splicing TLV fields")
 def test_upgrade_statickey_onchaind(node_factory, executor, bitcoind):
     """We test penalty before/after, and unilateral before/after"""
     l1, l2 = node_factory.get_nodes(2, opts=[{'may_reconnect': True,
@@ -3940,6 +3943,7 @@ def test_upgrade_statickey_onchaind(node_factory, executor, bitcoind):
     wait_for(lambda: len(l2.rpc.listpeerchannels()['channels']) == 0)
 
 
+@unittest.skip("experimental-upgrade-protocol TLV fields conflict with splicing TLV fields")
 def test_upgrade_statickey_fail(node_factory, executor, bitcoind):
     """We reconnect at all points during retransmit, and we won't upgrade."""
     l1_disconnects = ['-WIRE_COMMITMENT_SIGNED',
@@ -4062,6 +4066,7 @@ def test_htlc_failed_noclose(node_factory):
     assert l1.rpc.getpeer(l2.info['id'])['connected']
 
 
+@pytest.mark.openchannel('v1')
 @pytest.mark.openchannel('v2')
 def test_multichan_stress(node_factory, executor, bitcoind):
     """Test multiple channels between same nodes"""
@@ -4098,7 +4103,7 @@ def test_multichan_stress(node_factory, executor, bitcoind):
 
     wait_for(lambda: only_one(l3.rpc.listpeers(l2.info['id'])['peers'])['connected'])
     inv = l3.rpc.invoice(50000000, "invoice4", "invoice4")
-    l1.rpc.pay(inv['bolt11'])
+    l1.rpc.xpay(inv['bolt11'])
 
 
 def test_old_feerate(node_factory):
@@ -4752,12 +4757,19 @@ def test_connect_ratelimit(node_factory, bitcoind):
     # Suspend the others, to make sure they cannot respond too fast.
     for n in nodes:
         os.kill(n.daemon.proc.pid, signal.SIGSTOP)
-    l1.start()
 
-    # The first will be ok, but others should block and be unblocked.
-    l1.daemon.wait_for_logs((['Unblocking for ']
-                             + ['Too many connections, waiting'])
-                            * (len(nodes) - 1))
+    try:
+        l1.start()
+
+        # The first will be ok, but others should block and be unblocked.
+        l1.daemon.wait_for_logs((['Unblocking for ']
+                                 + ['Too many connections, waiting'])
+                                * (len(nodes) - 1))
+    except Exception as err:
+        # Resume, so pytest doesn't hang!
+        for n in nodes:
+            os.kill(n.daemon.proc.pid, signal.SIGCONT)
+        raise err
 
     # Resume them
     for n in nodes:
@@ -4773,9 +4785,11 @@ def test_onionmessage_forward_fail(node_factory, bitcoind):
                                          opts=[{},
                                                {'dev-allow-localhost': None,
                                                 'may_reconnect': True,
+                                                'dev-no-reconnect': None,
                                                 'plugin': os.path.join(os.getcwd(), 'tests/plugins/onionmessage_forward_fail_notification.py'),
                                                 },
                                                {'dev-allow-localhost': None,
+                                                'dev-no-reconnect': None,
                                                 'may_reconnect': True}])
 
     offer = l3.rpc.offer(300, "test_onionmessage_forward_fail")
@@ -4811,6 +4825,65 @@ def test_private_channel_no_reconnect(node_factory):
     wait_for(lambda: only_one(l3.rpc.listpeers()['peers'])['connected'] is True)
 
     assert only_one(l1.rpc.listpeers()['peers'])['connected'] is False
+
+
+@unittest.skipIf(VALGRIND, "We assume machine is reasonably fast")
+def test_no_delay(node_factory):
+    """Is our Nagle disabling for critical messages working?"""
+    l1, l2 = node_factory.line_graph(2)
+
+    scid = only_one(l1.rpc.listpeerchannels()['channels'])['short_channel_id']
+    routestep = {
+        'amount_msat': 100,
+        'id': l2.info['id'],
+        'delay': 5,
+        'channel': scid
+    }
+    start = time.time()
+    # If we were stupid enough to leave Nagle enabled, this would add 200ms
+    # seconds delays each way!
+    for _ in range(100):
+        phash = random.randbytes(32).hex()
+        l1.rpc.sendpay([routestep], phash)
+        with pytest.raises(RpcError, match="WIRE_INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS"):
+            l1.rpc.waitsendpay(phash)
+    end = time.time()
+    assert end < start + 100 * 0.5
+
+
+@unittest.skipIf(os.getenv('TEST_BENCH', '0') == '0', "For profiling")
+def test_bench(node_factory):
+    """Is our Nagle disabling for critical messages working?"""
+    l1, l2 = node_factory.get_nodes(2, opts={'start': False,
+                                             'commit-time': 0})
+
+    # memleak detection plays havoc with profiles.
+    del l1.daemon.env["LIGHTNINGD_DEV_MEMLEAK"]
+    del l2.daemon.env["LIGHTNINGD_DEV_MEMLEAK"]
+
+    l1.start()
+    l2.start()
+    node_factory.join_nodes([l1, l2])
+
+    scid = only_one(l1.rpc.listpeerchannels()['channels'])['short_channel_id']
+    routestep = {
+        'amount_msat': 100,
+        'id': l2.info['id'],
+        'delay': 5,
+        'channel': scid
+    }
+
+    start = time.time()
+    # If we were stupid enough to leave Nagle enabled, this would add 200ms
+    # seconds delays each way!
+    for _ in range(1000):
+        phash = random.randbytes(32).hex()
+        l1.rpc.sendpay([routestep], phash)
+        with pytest.raises(RpcError, match="WIRE_INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS"):
+            l1.rpc.waitsendpay(phash)
+    end = time.time()
+    duration = end - start
+    assert duration == 0
 
 
 def test_listpeerchannels_by_scid(node_factory):

@@ -717,7 +717,7 @@ openchannel_hook_final(struct openchannel_hook_payload *payload STEALS)
 	if (wallet_can_spend(payload->openingd->ld->wallet,
 			     our_upfront_shutdown_script,
 			     tal_bytelen(our_upfront_shutdown_script),
-			     &found_wallet_index)) {
+			     &found_wallet_index, NULL)) {
 		upfront_shutdown_script_wallet_index = tal(tmpctx, u32);
 		*upfront_shutdown_script_wallet_index = found_wallet_index;
 	} else
@@ -1301,7 +1301,7 @@ static struct command_result *json_fundchannel_start(struct command *cmd,
 	}
 
 	if (!mindepth)
-		mindepth = tal_dup(cmd, u32, &cmd->ld->config.anchor_confirms);
+		mindepth = tal_dup(cmd, u32, &cmd->ld->config.funding_confirms);
 
 	if (push_msat && amount_msat_greater_sat(*push_msat, *amount))
 		return command_fail(cmd, FUND_CANNOT_AFFORD,
@@ -1408,7 +1408,7 @@ static struct command_result *json_fundchannel_start(struct command *cmd,
 	if (wallet_can_spend(fc->cmd->ld->wallet,
 			     fc->our_upfront_shutdown_script,
 			     tal_bytelen(fc->our_upfront_shutdown_script),
-			     &found_wallet_index)) {
+			     &found_wallet_index, NULL)) {
 		upfront_shutdown_script_wallet_index = tal(tmpctx, u32);
 		*upfront_shutdown_script_wallet_index = found_wallet_index;
 	} else

@@ -338,7 +338,6 @@ static struct utxo *wallet_stmt2output(const tal_t *ctx, struct db_stmt *stmt)
 	db_col_txid(stmt, "prev_out_tx", &utxo->outpoint.txid);
 	utxo->outpoint.n = db_col_int(stmt, "prev_out_index");
 	utxo->amount = db_col_amount_sat(stmt, "value");
-	utxo->is_p2sh = db_col_int(stmt, "type") == p2sh_wpkh;
 	utxo->status = db_col_int(stmt, "status");
 	utxo->keyindex = db_col_int(stmt, "keyindex");
 
@@ -364,6 +363,19 @@ static struct utxo *wallet_stmt2output(const tal_t *ctx, struct db_stmt *stmt)
 	}
 
 	utxo->scriptPubkey = db_col_arr(utxo, stmt, "scriptpubkey", u8);
+	/* FIXME: add p2tr to type? */
+	if (wallet_output_type_in_db(db_col_int(stmt, "type")) == WALLET_OUTPUT_P2SH_WPKH)
+		utxo->utxotype = UTXO_P2SH_P2WPKH;
+	else if (is_p2wpkh(utxo->scriptPubkey, tal_bytelen(utxo->scriptPubkey), NULL))
+		utxo->utxotype = UTXO_P2WPKH;
+	else if (is_p2tr(utxo->scriptPubkey, tal_bytelen(utxo->scriptPubkey), NULL))
+		utxo->utxotype = UTXO_P2TR;
+	else if (is_p2wsh(utxo->scriptPubkey, tal_bytelen(utxo->scriptPubkey), NULL)) {
+		if (!utxo->close_info)
+			fatal("Unspendable scriptPubkey without close_info %s", tal_hex(tmpctx, utxo->scriptPubkey));
+		utxo->utxotype = UTXO_P2WSH_FROM_CLOSE;
+	} else
+		fatal("Unknown utxo type %s", tal_hex(tmpctx, utxo->scriptPubkey));
 
 	utxo->blockheight = NULL;
 	utxo->spendheight = NULL;
@@ -562,13 +574,29 @@ struct utxo *wallet_utxo_get(const tal_t *ctx, struct wallet *w,
 	return utxo;
 }
 
+static u32 calc_feerate(struct amount_sat excess_sats,
+			struct amount_sat output_sats_required,
+			size_t weight)
+{
+	struct amount_sat fee;
+	u32 feerate;
+
+	if (!amount_sat_sub(&fee, excess_sats, output_sats_required))
+		return 0;
+	if (!amount_feerate(&feerate, fee, weight))
+		abort();
+	return feerate;
+}
+
 /* Gather enough utxos to meet feerate, otherwise all we can. */
 struct utxo **wallet_utxo_boost(const tal_t *ctx,
 				struct wallet *w,
 				u32 blockheight,
-				struct amount_sat fee_amount,
+				struct amount_sat excess_sats,
+				struct amount_sat output_sats_required,
 				u32 feerate_target,
-				size_t *weight)
+				size_t *weight,
+				bool *insufficient)
 {
 	struct utxo **all_utxos = wallet_get_unspent_utxos(tmpctx, w);
 	struct utxo **utxos = tal_arr(ctx, struct utxo *, 0);
@@ -577,20 +605,26 @@ struct utxo **wallet_utxo_boost(const tal_t *ctx,
 	/* Select in random order */
 	tal_arr_randomize(all_utxos, struct utxo *);
 
-	/* Can't overflow, it's from our tx! */
-	if (!amount_feerate(&feerate, fee_amount, *weight))
-		abort();
+	feerate = calc_feerate(excess_sats, output_sats_required, *weight);
 
 	for (size_t i = 0; i < tal_count(all_utxos); i++) {
 		u32 new_feerate;
 		size_t new_weight;
-		struct amount_sat new_fee_amount;
+		struct amount_sat new_excess_sats;
 		/* Convenience var */
 		struct utxo *utxo = all_utxos[i];
 
 		/* Are we already happy? */
-		if (feerate >= feerate_target)
-			break;
+		if (feerate >= feerate_target) {
+			log_debug(w->log, "wallet_utxo_boost: got %zu UTXOs, excess %s (needed %s), weight %zu, feerate %u >= %u",
+				  tal_count(utxos),
+				  fmt_amount_sat(tmpctx, excess_sats),
+				  fmt_amount_sat(tmpctx, output_sats_required),
+				  *weight, feerate, feerate_target);
+			if (insufficient)
+				*insufficient = false;
+			return utxos;
+		}
 
 		/* Don't add reserved ones */
 		if (utxo_is_reserved(utxo, blockheight))
@@ -601,13 +635,13 @@ struct utxo **wallet_utxo_boost(const tal_t *ctx,
 			continue;
 
 		/* UTXOs must be sane amounts */
-		if (!amount_sat_add(&new_fee_amount,
-				    fee_amount, utxo->amount))
+		if (!amount_sat_add(&new_excess_sats,
+				    excess_sats, utxo->amount))
 			abort();
 
 		new_weight = *weight + utxo_spend_weight(utxo, 0);
-		if (!amount_feerate(&new_feerate, new_fee_amount, new_weight))
-			abort();
+		new_feerate = calc_feerate(new_excess_sats, output_sats_required,
+					   new_weight);
 
 		/* Don't add uneconomic ones! */
 		if (new_feerate < feerate)
@@ -615,10 +649,14 @@ struct utxo **wallet_utxo_boost(const tal_t *ctx,
 
 		feerate = new_feerate;
 		*weight = new_weight;
-		fee_amount = new_fee_amount;
+		excess_sats = new_excess_sats;
 		tal_arr_expand(&utxos, tal_steal(utxos, utxo));
 	}
 
+	log_debug(w->log, "wallet_utxo_boost: fell short, returning %zu UTXOs",
+		  tal_count(utxos));
+	if (insufficient)
+		*insufficient = true;
 	return utxos;
 }
 
@@ -776,7 +814,7 @@ struct utxo *wallet_find_utxo(const tal_t *ctx, struct wallet *w,
 	while (!utxo && db_step(stmt)) {
 		utxo = wallet_stmt2output(ctx, stmt);
 		if (excluded(excludes, utxo)
-		    || (nonwrapped && utxo->is_p2sh)
+		    || (nonwrapped && utxo->utxotype == UTXO_P2SH_P2WPKH)
 		    || !deep_enough(maxheight, utxo, current_blockheight))
 			utxo = tal_free(utxo);
 
@@ -885,7 +923,7 @@ bool wallet_add_onchaind_utxo(struct wallet *w,
 	db_bind_txid(stmt, &outpoint->txid);
 	db_bind_int(stmt, outpoint->n);
 	db_bind_amount_sat(stmt, &amount);
-	db_bind_int(stmt, wallet_output_type_in_db(p2wpkh));
+	db_bind_int(stmt, wallet_output_type_in_db(WALLET_OUTPUT_P2WPKH));
 	db_bind_int(stmt, OUTPUT_STATE_AVAILABLE);
 	db_bind_int(stmt, 0);
 	db_bind_u64(stmt, channel->dbid);
@@ -910,7 +948,7 @@ bool wallet_add_onchaind_utxo(struct wallet *w,
 }
 
 bool wallet_can_spend(struct wallet *w, const u8 *script, size_t script_len,
-		      u32 *index)
+		      u32 *index, enum addrtype *addrtype)
 {
 	u64 bip32_max_index;
 	const struct wallet_address *waddr;
@@ -931,6 +969,8 @@ bool wallet_can_spend(struct wallet *w, const u8 *script, size_t script_len,
 		db_set_intvar(w->db, "bip32_max_index", waddr->index);
 
 	*index = waddr->index;
+	if (addrtype)
+		*addrtype = waddr->addrtype;
 	return true;
 }
 
@@ -1374,8 +1414,9 @@ void wallet_inflight_add(struct wallet *w, struct channel_inflight *inflight)
 				 ", i_am_initiator"
 				 ", force_sign_first"
 				 ", remote_funding"
+				 ", locked_scid"
 				 ") VALUES ("
-				 "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);"));
+				 "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);"));
 
 	db_bind_u64(stmt, inflight->channel->dbid);
 	db_bind_txid(stmt, &inflight->funding->outpoint.txid);
@@ -1418,6 +1459,10 @@ void wallet_inflight_add(struct wallet *w, struct channel_inflight *inflight)
 		db_bind_pubkey(stmt, inflight->funding->splice_remote_funding);
 	else
 		db_bind_null(stmt);
+	if (inflight->locked_scid)
+		db_bind_short_channel_id(stmt, *inflight->locked_scid);
+	else
+		db_bind_null(stmt);
 
 	db_exec_prepared_v2(stmt);
 	assert(!stmt->error);
@@ -1446,17 +1491,18 @@ void wallet_inflight_save(struct wallet *w,
 	struct db_stmt *stmt;
 	/* The *only* thing you can update on an
 	 * inflight is the funding PSBT (to add sigs)
-	 * and the last_tx/last_sig if this is for a splice */
+	 * and the last_tx/last_sig or locked_scid if this is for a splice */
 	stmt = db_prepare_v2(w->db,
 			     SQL("UPDATE channel_funding_inflights SET"
 				 "  funding_psbt=?" // 0
 				 ", funding_tx_remote_sigs_received=?" // 1
 				 ", last_tx=?" // 2
 				 ", last_sig=?" // 3
+				 ", locked_scid=?" // 4
 				 " WHERE"
-				 "  channel_id=?" // 4
-				 " AND funding_tx_id=?" // 5
-				 " AND funding_tx_outnum=?")); // 6
+				 "  channel_id=?" // 5
+				 " AND funding_tx_id=?" // 6
+				 " AND funding_tx_outnum=?")); // 7
 	db_bind_psbt(stmt, inflight->funding_psbt);
 	db_bind_int(stmt, inflight->remote_tx_sigs);
 	if (inflight->last_tx) {
@@ -1466,11 +1512,29 @@ void wallet_inflight_save(struct wallet *w,
 		db_bind_null(stmt);
 		db_bind_null(stmt);
 	}
+	if (inflight->locked_scid)
+		db_bind_short_channel_id(stmt, *inflight->locked_scid);
+	else
+		db_bind_null(stmt);
 	db_bind_u64(stmt, inflight->channel->dbid);
 	db_bind_txid(stmt, &inflight->funding->outpoint.txid);
 	db_bind_int(stmt, inflight->funding->outpoint.n);
 
 	db_exec_prepared_v2(take(stmt));
+}
+
+static struct short_channel_id *db_col_optional_scid(const tal_t *ctx,
+						     struct db_stmt *stmt,
+						     const char *colname)
+{
+	struct short_channel_id *scid;
+
+	if (db_col_is_null(stmt, colname))
+		return NULL;
+
+	scid = tal(ctx, struct short_channel_id);
+	*scid = db_col_short_channel_id(stmt, colname);
+	return scid;
 }
 
 void wallet_channel_clear_inflights(struct wallet *w,
@@ -1564,6 +1628,8 @@ wallet_stmt2inflight(struct wallet *w, struct db_stmt *stmt,
 				i_am_initiator,
 				force_sign_first);
 
+	inflight->locked_scid = db_col_optional_scid(inflight, stmt, "locked_scid");
+
 	/* last_tx is null for not yet committed
 	 * channels + static channel backup recoveries */
 	if (!db_col_is_null(stmt, "last_tx")) {
@@ -1615,6 +1681,7 @@ static bool wallet_channel_load_inflights(struct wallet *w,
 					", i_am_initiator"
 					", force_sign_first"
 					", remote_funding"
+					", locked_scid"
 					" FROM channel_funding_inflights"
 					" WHERE channel_id = ?"
 					" ORDER BY funding_feerate"));
@@ -1661,20 +1728,6 @@ static bool wallet_channel_config_load(struct wallet *w, const u64 id,
 	cc->max_dust_htlc_exposure_msat = db_col_amount_msat(stmt, "max_dust_htlc_exposure_msat");
 	tal_free(stmt);
 	return ok;
-}
-
-static struct short_channel_id *db_col_optional_scid(const tal_t *ctx,
-						     struct db_stmt *stmt,
-						     const char *colname)
-{
-	struct short_channel_id *scid;
-
-	if (db_col_is_null(stmt, colname))
-		return NULL;
-
-	scid = tal(ctx, struct short_channel_id);
-	*scid = db_col_short_channel_id(stmt, colname);
-	return scid;
 }
 
 static struct channel_state_change **wallet_state_change_get(const tal_t *ctx,
@@ -3014,6 +3067,7 @@ void wallet_confirm_tx(struct wallet *w,
 
 static void got_utxo(struct wallet *w,
 		     u64 keyindex,
+		     enum addrtype addrtype,
 		     const struct wally_tx *wtx,
 		     size_t outnum,
 		     bool is_coinbase,
@@ -3025,7 +3079,24 @@ static void got_utxo(struct wallet *w,
 	struct amount_asset asset = wally_tx_output_get_amount(txout);
 
 	utxo->keyindex = keyindex;
-	utxo->is_p2sh = is_p2sh(txout->script, txout->script_len, NULL);
+	/* This switch() pattern catches anyone adding new cases, plus
+	 * runtime errors */
+	switch (addrtype) {
+	case ADDR_P2SH_SEGWIT:
+		utxo->utxotype = UTXO_P2SH_P2WPKH;
+		goto type_ok;
+	case ADDR_BECH32:
+		utxo->utxotype = UTXO_P2WPKH;
+		goto type_ok;
+	case ADDR_P2TR:
+		utxo->utxotype = UTXO_P2TR;
+		goto type_ok;
+	case ADDR_ALL:
+		break;
+	}
+	abort();
+
+type_ok:
 	utxo->amount = amount_asset_to_sat(&asset);
 	utxo->status = OUTPUT_STATE_AVAILABLE;
 	wally_txid(wtx, &utxo->outpoint.txid);
@@ -3039,7 +3110,7 @@ static void got_utxo(struct wallet *w,
 	log_debug(w->log, "Owning output %zu %s (%s) txid %s%s%s",
 		  outnum,
 		  fmt_amount_sat(tmpctx, utxo->amount),
-		  utxo->is_p2sh ? "P2SH" : "SEGWIT",
+		  utxotype_to_str(utxo->utxotype),
 		  fmt_bitcoin_txid(tmpctx, &utxo->outpoint.txid),
 		  blockheight ? " CONFIRMED" : "",
 		  is_coinbase ? " COINBASE" : "");
@@ -3055,7 +3126,7 @@ static void got_utxo(struct wallet *w,
 		notify_chain_mvt(w->ld, mvt);
 	}
 
-	if (!wallet_add_utxo(w, utxo, utxo->is_p2sh ? p2sh_wpkh : our_change)) {
+	if (!wallet_add_utxo(w, utxo, utxo->utxotype == UTXO_P2SH_P2WPKH ? WALLET_OUTPUT_P2SH_WPKH : WALLET_OUTPUT_OUR_CHANGE)) {
 		/* In case we already know the output, make
 		 * sure we actually track its
 		 * blockheight. This can happen when we grab
@@ -3067,7 +3138,7 @@ static void got_utxo(struct wallet *w,
 	}
 
 	/* This is an unconfirmed change output, we should track it */
-	if (!utxo->is_p2sh && !blockheight)
+	if (utxo->utxotype != UTXO_P2SH_P2WPKH && !blockheight)
 		txfilter_add_scriptpubkey(w->ld->owned_txfilter, txout->script);
 
 	outpointfilter_add(w->owned_outpoints, &utxo->outpoint);
@@ -3087,14 +3158,15 @@ int wallet_extract_owned_outputs(struct wallet *w, const struct wally_tx *wtx,
 		const struct wally_tx_output *txout = &wtx->outputs[i];
 		u32 keyindex;
 		struct amount_asset asset = wally_tx_output_get_amount(txout);
+		enum addrtype addrtype;
 
 		if (!amount_asset_is_main(&asset))
 			continue;
 
-		if (!wallet_can_spend(w, txout->script, txout->script_len, &keyindex))
+		if (!wallet_can_spend(w, txout->script, txout->script_len, &keyindex, &addrtype))
 			continue;
 
-		got_utxo(w, keyindex, wtx, i, is_coinbase, blockheight, NULL);
+		got_utxo(w, keyindex, addrtype, wtx, i, is_coinbase, blockheight, NULL);
 		num_utxos++;
 	}
 	return num_utxos;
@@ -6751,7 +6823,7 @@ static void mutual_close_p2pkh_catch(struct bitcoind *bitcoind,
 					   missing->addrs[n].scriptpubkey,
 					   tal_bytelen(missing->addrs[n].scriptpubkey)))
 					continue;
-				got_utxo(w, missing->addrs[n].keyidx,
+				got_utxo(w, missing->addrs[n].keyidx, ADDR_BECH32,
 					 wtx, outnum, i == 0, &height, &outp);
 				log_broken(bitcoind->ld->log, "Rescan found %s!",
 					   fmt_bitcoin_outpoint(tmpctx, &outp));

@@ -4,6 +4,7 @@
 #include <ccan/array_size/array_size.h>
 #include <ccan/cast/cast.h>
 #include <common/addr.h>
+#include <common/base64.h>
 #include <common/bech32.h>
 #include <common/configdir.h>
 #include <common/json_command.h>
@@ -349,7 +350,7 @@ static void json_add_utxo(struct json_stream *response,
 	json_add_num(response, "output", utxo->outpoint.n);
 	json_add_amount_sat_msat(response, "amount_msat", utxo->amount);
 
-	if (utxo->is_p2sh) {
+	if (utxo->utxotype == UTXO_P2SH_P2WPKH) {
 		struct pubkey key;
 		bip32_pubkey(wallet->ld, &key, utxo->keyindex);
 
@@ -693,7 +694,7 @@ static struct command_result *match_psbt_inputs_to_utxos(struct command *cmd,
 		if (!psbt->inputs[i].utxo && !psbt->inputs[i].witness_utxo) {
 			u8 *scriptPubKey;
 
-			if (utxo->is_p2sh) {
+			if (utxo->utxotype == UTXO_P2SH_P2WPKH) {
 				struct pubkey key;
 				u8 *redeemscript;
 				int wally_err;
@@ -729,7 +730,7 @@ static void match_psbt_outputs_to_wallet(struct wally_psbt *psbt,
 		const size_t script_len = psbt->outputs[outndx].script_len;
 		u32 index;
 
-		if (!wallet_can_spend(w, script, script_len, &index))
+		if (!wallet_can_spend(w, script, script_len, &index, NULL))
 			continue;
 
 		if (bip32_key_from_parent(
@@ -779,6 +780,7 @@ static struct command_result *json_signpsbt(struct command *cmd,
 	struct json_stream *response;
 	struct wally_psbt *psbt, *signed_psbt;
 	struct utxo **utxos;
+	const struct hsm_utxo **hsm_utxos;
 	u32 *input_nums;
 	u32 psbt_version;
 
@@ -826,9 +828,8 @@ static struct command_result *json_signpsbt(struct command *cmd,
 
 	/* FIXME: hsm will sign almost anything, but it should really
 	 * fail cleanly (not abort!) and let us report the error here. */
-	u8 *msg = towire_hsmd_sign_withdrawal(cmd,
-					     cast_const2(const struct utxo **, utxos),
-					     psbt);
+	hsm_utxos = utxos_to_hsm_utxos(tmpctx, utxos);
+	u8 *msg = towire_hsmd_sign_withdrawal(cmd, hsm_utxos, psbt);
 
 	if (!wire_sync_write(cmd->ld->hsm_fd, take(msg)))
 		fatal("Could not write sign_withdrawal to HSM: %s",
@@ -936,7 +937,7 @@ static void maybe_notify_new_external_send(struct lightningd *ld,
 	/* If it's going to our wallet, ignore */
 	script = wally_psbt_output_get_script(tmpctx,
 					      &psbt->outputs[outnum]);
-	if (wallet_can_spend(ld->wallet, script, tal_bytelen(script), &index))
+	if (wallet_can_spend(ld->wallet, script, tal_bytelen(script), &index, NULL))
 		return;
 
 	outpoint.txid = *txid;
@@ -997,6 +998,42 @@ static void sendpsbt_done(struct bitcoind *bitcoind UNUSED,
 	json_add_txid(response, "txid", &txid);
 	was_pending(command_success(sending->cmd, response));
 }
+
+static struct command_result *json_dev_finalizepsbt(struct command *cmd,
+						    const char *buffer,
+						    const jsmntok_t *obj,
+						    const jsmntok_t *params)
+{
+	struct wally_psbt *psbt;
+	struct wally_tx *wtx;
+	struct bitcoin_txid txid;
+	struct json_stream *response;
+
+	if (!param_check(cmd, buffer, params,
+			 p_req("psbt", param_psbt, &psbt),
+			 NULL))
+		return command_param_failed();
+
+	if (!psbt_finalize(psbt))
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "PSBT not finalizeable");
+
+	wtx = psbt_final_tx(cmd, psbt);
+	wally_txid(wtx, &txid);
+
+	response = json_stream_success(cmd);
+	json_add_psbt(response, "psbt", psbt);
+	json_add_hex_talarr(response, "tx", linearize_wtx(tmpctx, wtx));
+	json_add_txid(response, "txid", &txid);
+	return command_success(cmd, response);
+}
+
+static const struct json_command dev_finalizepsbt_command = {
+	"dev-finalizepsbt",
+	json_dev_finalizepsbt,
+	true,
+};
+AUTODATA(json_command, &dev_finalizepsbt_command);
 
 static struct command_result *json_sendpsbt(struct command *cmd,
 					    const char *buffer,
@@ -1066,3 +1103,117 @@ static const struct json_command sendpsbt_command = {
 };
 
 AUTODATA(json_command, &sendpsbt_command);
+
+static struct command_result *
+json_signmessagewithkey(struct command *cmd, const char *buffer,
+			const jsmntok_t *obj UNNEEDED, const jsmntok_t *params)
+{
+	/* decoding the address */
+	const u8 *scriptpubkey;
+	const char *message;
+
+	/* from wallet BIP32 */
+	struct pubkey pubkey;
+
+	if (!param(
+		cmd, buffer, params,
+                p_req("message", param_string, &message),
+		p_req("address", param_bitcoin_address, &scriptpubkey),
+                NULL))
+		return command_param_failed();
+
+	const size_t script_len = tal_bytelen(scriptpubkey);
+
+	/* FIXME: we already had the address from the input */
+	char *addr;
+	addr = encode_scriptpubkey_to_addr(tmpctx, chainparams, scriptpubkey);
+
+	if (!is_p2wpkh(scriptpubkey, script_len, NULL)) {
+		/* FIXME add support for BIP 322 */
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "Address is not p2wpkh and "
+				    "it is not supported for signing");
+	}
+
+	if (!hsm_capable(cmd->ld, WIRE_HSMD_BIP137_SIGN_MESSAGE)) {
+		return command_fail(
+		    cmd, JSONRPC2_INVALID_PARAMS,
+		    "HSM does not support signing BIP137 signing.");
+	}
+
+	const u32 bip32_max_index =
+	    db_get_intvar(cmd->ld->wallet->db, "bip32_max_index", 0);
+        bool match_found = false;
+	u32 keyidx;
+        enum addrtype addrtype;
+
+	/* loop over all generated keys, find a matching key */
+	for (keyidx = 1; keyidx <= bip32_max_index; keyidx++) {
+		bip32_pubkey(cmd->ld, &pubkey, keyidx);
+		u8 *redeemscript_p2wpkh;
+		char *out_p2wpkh = encode_pubkey_to_addr(
+		    cmd, &pubkey, ADDR_BECH32, &redeemscript_p2wpkh);
+		if (!out_p2wpkh) {
+			abort();
+		}
+		/* wallet_get_addrtype fails for entries prior to v24.11, all
+		 * address types are assumed in that case. */
+		if (!wallet_get_addrtype(cmd->ld->wallet, keyidx, &addrtype))
+			addrtype = ADDR_ALL;
+		if (streq(addr, out_p2wpkh) &&
+		    (addrtype == ADDR_BECH32 || addrtype == ADDR_ALL)) {
+			match_found = true;
+			break;
+		}
+	}
+
+	if (!match_found) {
+		return command_fail(
+		    cmd, JSONRPC2_INVALID_PARAMS,
+		    "Address is not found in the wallet's database");
+	}
+
+	/* wire to hsmd a sign request */
+	u8 *msg = towire_hsmd_bip137_sign_message(
+	    cmd, tal_dup_arr(tmpctx, u8, (u8 *)message, strlen(message), 0),
+	    keyidx);
+	if (!wire_sync_write(cmd->ld->hsm_fd, take(msg))) {
+		fatal("Could not write sign_with_key to HSM: %s",
+		      strerror(errno));
+	}
+
+	/* read form hsmd a sign reply */
+	msg = wire_sync_read(cmd, cmd->ld->hsm_fd);
+
+	int recid;
+	u8 sig[65];
+	secp256k1_ecdsa_recoverable_signature rsig;
+
+	if (!fromwire_hsmd_bip137_sign_message_reply(msg, &rsig)) {
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "HSM gave bad sign_with_key_reply %s",
+				    tal_hex(tmpctx, msg));
+	}
+
+	secp256k1_ecdsa_recoverable_signature_serialize_compact(
+	    secp256k1_ctx, sig + 1, &recid, &rsig);
+        /* this is the header value for P2WPKH specified in BIP137 */
+	sig[0] = recid + 39;
+
+	/* FIXME: Given the fact that we plan to extend support for BIP322
+         * signature in the future making a pubkey output here makes less sense. */
+	struct json_stream *response;
+	response = json_stream_success(cmd);
+	json_add_string(response, "address", addr);
+	json_add_pubkey(response, "pubkey", &pubkey);
+	json_add_hex(response, "signature", sig, sizeof(sig));
+	json_add_string(response, "base64",
+			b64_encode(tmpctx, sig, sizeof(sig)));
+	return command_success(cmd, response);
+}
+
+static const struct json_command signmessagewithkey_command = {
+	"signmessagewithkey",
+	json_signmessagewithkey
+};
+AUTODATA(json_command, &signmessagewithkey_command);

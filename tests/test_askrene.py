@@ -277,6 +277,23 @@ def test_layers(node_factory):
     with pytest.raises(RpcError, match="bias: should be a number between -100 and 100"):
         l2.rpc.askrene_bias_channel('test_layers', '1x1x1/1', 101, "bigger bias")
 
+    # We can make them relative.
+    l2.rpc.askrene_bias_channel('test_layers', '1x1x1/1', 1, 'adding bias', True)
+    expect['biases'] = [{'short_channel_id_dir': '1x1x1/1', 'bias': -4, 'description': "adding bias"}]
+    listlayers = l2.rpc.askrene_listlayers('test_layers')
+    assert listlayers == {'layers': [expect]}
+
+    l2.rpc.askrene_bias_channel(layer='test_layers', short_channel_id_dir='1x1x1/1', bias=-1, relative=True)
+    expect['biases'] = [{'short_channel_id_dir': '1x1x1/1', 'bias': -5}]
+    listlayers = l2.rpc.askrene_listlayers('test_layers')
+    assert listlayers == {'layers': [expect]}
+
+    # They truncate on +/- 100 though:
+    l2.rpc.askrene_bias_channel('test_layers', '1x1x1/1', -99, None, True)
+    expect['biases'] = [{'short_channel_id_dir': '1x1x1/1', 'bias': -100}]
+    listlayers = l2.rpc.askrene_listlayers('test_layers')
+    assert listlayers == {'layers': [expect]}
+
     # We can remove them.
     l2.rpc.askrene_bias_channel('test_layers', '1x1x1/1', 0)
     expect['biases'] = []
@@ -1420,3 +1437,39 @@ def test_askrene_fake_channeld(node_factory, bitcoind):
                                                       'constrained')
                     else:
                         raise err
+
+
+def test_simple_dummy_channel(node_factory):
+    """Test if askrene can resolve a route with dummy channels, ie. channels
+    that we might set artificially to resolve blinded paths and self payments,
+    they have unlimited capacities and possibly zero fees."""
+    ALOT = "2100000000000000sat"
+    node1 = "020000000000000000000000000000000000000000000000000000000000000001"
+    node2 = "020000000000000000000000000000000000000000000000000000000000000002"
+    l1 = node_factory.get_node()
+    l1.rpc.askrene_create_layer("mylayer")
+    l1.rpc.askrene_create_channel(
+        layer="mylayer",
+        source=node1,
+        destination=node2,
+        short_channel_id="0x0x0",
+        capacity_msat=ALOT,
+    )
+    l1.rpc.askrene_update_channel(
+        layer="mylayer",
+        short_channel_id_dir="0x0x0/0",
+        enabled=True,
+        htlc_minimum_msat=0,
+        htlc_maximum_msat=ALOT,
+        fee_base_msat=0,
+        fee_proportional_millionths=0,
+        cltv_expiry_delta=5,
+    )
+    l1.rpc.getroutes(
+        source=node1,
+        destination=node2,
+        amount_msat=100,
+        maxfee_msat=5000,
+        final_cltv=5,
+        layers=["mylayer"],
+    )

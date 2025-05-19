@@ -548,9 +548,13 @@ void bitcoin_tx_finalize(struct bitcoin_tx *tx)
 	assert(bitcoin_tx_check(tx));
 }
 
-struct bitcoin_tx *bitcoin_tx_with_psbt(const tal_t *ctx, struct wally_psbt *psbt STEALS)
+struct bitcoin_tx *bitcoin_tx_with_psbt(const tal_t *ctx, struct wally_psbt *psbt TAKES)
 {
 	size_t locktime;
+
+	if (!taken(psbt))
+		psbt = clone_psbt(tmpctx, psbt);
+
 	wally_psbt_get_locktime(psbt, &locktime);
 	struct bitcoin_tx *tx = bitcoin_tx(ctx, chainparams,
 					   psbt->num_inputs,
@@ -893,7 +897,8 @@ size_t bitcoin_tx_input_sig_weight(void)
 /* Input weight */
 size_t bitcoin_tx_input_weight(bool p2sh, size_t witness_weight)
 {
-	size_t weight = witness_weight;
+	/* We assume < 253 witness elements */
+	size_t weight = 1 + witness_weight;
 
 	/* Input weight: txid + index + sequence */
 	weight += (32 + 4 + 4) * 4;
@@ -912,17 +917,32 @@ size_t bitcoin_tx_input_weight(bool p2sh, size_t witness_weight)
 	return weight;
 }
 
-size_t bitcoin_tx_simple_input_witness_weight(void)
+size_t bitcoin_tx_input_witness_weight(enum utxotype utxotype)
 {
-	/* Account for witness (1 byte count + sig + key) */
-	return 1 + (bitcoin_tx_input_sig_weight() + 1 + 33);
-}
-
-/* We only do segwit inputs, and we assume witness is sig + key  */
-size_t bitcoin_tx_simple_input_weight(bool p2sh)
-{
-	return bitcoin_tx_input_weight(p2sh,
-				       bitcoin_tx_simple_input_witness_weight());
+	switch (utxotype) {
+	case UTXO_P2SH_P2WPKH:
+	case UTXO_P2WPKH:
+		/* Account for witness (sig + key) */
+		return bitcoin_tx_input_sig_weight() + 1 + 33;
+	case UTXO_P2WSH_FROM_CLOSE:
+		/* BOLT #3:
+		 * #### `to_remote` Output
+		 *
+		 * If `option_anchors` applies to the commitment
+		 * transaction, the `to_remote` output is encumbered by a one
+		 * block csv lock.
+		 *    <remotepubkey> OP_CHECKSIGVERIFY 1 OP_CHECKSEQUENCEVERIFY
+		 *
+		 * The output is spent by an input with `nSequence` field set
+		 * to `1` and witness: <remote_sig>
+		 * Otherwise, this output is a simple P2WPKH to `remotepubkey`.
+		 */
+		/* In practice, these predate anchors, so: */
+		return 1 + 1 + bitcoin_tx_input_sig_weight();
+	case UTXO_P2TR:
+		return 1 + 64;
+	}
+	abort();
 }
 
 size_t bitcoin_tx_2of2_input_witness_weight(void)

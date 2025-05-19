@@ -10,7 +10,7 @@ from collections import OrderedDict
 from decimal import Decimal
 from pyln.client import LightningRpc
 from pyln.client import Millisatoshi
-from pyln.client import NodeVersion, VersionSpec
+from pyln.client import NodeVersion
 
 import ephemeral_port_reserve  # type: ignore
 import json
@@ -629,11 +629,8 @@ class LightningD(TailableProc):
         cln_version_proc = subprocess.check_output([self.executable, "--version"])
         self.cln_version = NodeVersion(cln_version_proc.decode('ascii').strip())
 
-        try:
-            if VersionSpec.parse("<=v24.02.2").matches(self.cln_version):
-                self.opts['log-level'] = "debug"
-        except Exception:
-            raise ValueError(f"Invalid version {type(self.cln_version)} - {self.cln_version}")
+        if self.cln_version <= "v24.02.2":
+            self.opts['log-level'] = "debug"
 
         opts = {
             'lightning-dir': lightning_dir,
@@ -671,11 +668,9 @@ class LightningD(TailableProc):
         # In case you want specific ordering!
         self.early_opts = []
 
-        try:
-            if VersionSpec.parse(">=v23.11").matches(self.cln_version):
-                self.early_opts.append('--developer')
-        except Exception:
-            raise ValueError(f"Invalid version {type(self.cln_version)} - {self.cln_version}")
+        # Before this we had a developer build option.
+        if self.cln_version >= "v23.11":
+            self.early_opts.append('--developer')
 
     def cleanup(self):
         # To force blackhole to exit, disconnect file must be truncated!
@@ -855,11 +850,8 @@ class LightningNode(object):
         if EXPERIMENTAL_SPLICING:
             self.daemon.opts["experimental-splicing"] = None
         # Avoid test flakes cause by this option unless explicitly set.
-        try:
-            if VersionSpec.parse(">=v24.11").matches(self.cln_version):
-                self.daemon.opts.update({"autoconnect-seeker-peers": 0})
-        except Exception:
-            raise ValueError(f"Invalid version {type(self.cln_version)} - {self.cln_version}")
+        if self.cln_version >= "v24.11":
+            self.daemon.opts.update({"autoconnect-seeker-peers": 0})
 
         if options is not None:
             self.daemon.opts.update(options)
@@ -1204,7 +1196,7 @@ class LightningNode(object):
         #
         # The field `updates`-field didn't exist prio to v24.02 and will be
         # ignored for older versions of cln
-        if VersionSpec.parse(">=v24.02").matches(self.cln_version):
+        if self.cln_version >= "v24.02":
             if "remote" not in channel.get("updates", {}):
                 return False
 
@@ -1220,8 +1212,7 @@ class LightningNode(object):
         return (chanid, 0) in active and (chanid, 1) in active
 
     def wait_for_channel_onchain(self, peerid):
-        txid = only_one(self.rpc.listpeerchannels(peerid)['channels'])['scratch_txid']
-        wait_for(lambda: txid in self.bitcoin.rpc.getrawmempool())
+        wait_for(lambda: only_one(self.rpc.listpeerchannels(peerid)['channels'])['scratch_txid'] in self.bitcoin.rpc.getrawmempool())
 
     def wait_channel_active(self, scid):
         wait_for(lambda: self.is_channel_active(scid))
