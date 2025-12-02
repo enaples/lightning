@@ -1,0 +1,73 @@
+name: Pytest test
+run-name: Pytest test - ${{ github.ref_name }}
+
+on:
+  push:
+    branches:
+      - "test-v*"
+
+# Cancel previous runs on the same branch to save resources
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # General Build/Test Settings
+  RUST_PROFILE: release
+  SLOW_MACHINE: 1
+  VALGRIND: 0
+  COMPILER: gcc
+  
+  # Network and DB Settings
+  TEST_NETWORK: regtest
+  TEST_DB_PROVIDER: sqlite3
+  
+  # Test Runner Settings
+  TEST_DEBUG: 1
+  PYTEST_OPTS: --timeout=1200 --durations=10
+  PYTEST_PAR: 10 # Number of parallel tests, adjust based on runner size if needed
+
+jobs:
+  run-tests:
+    name: Build and Test
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install System Dependencies
+        # setup.sh installs libraries needed to compile CLN
+        run: |
+          bash -x .github/scripts/setup.sh
+          sudo apt-get update -qq
+
+      - name: Install Bitcoind
+        # Essential for integration tests. Uses env vars to determine version/network.
+        run: .github/scripts/install-bitcoind.sh
+
+      - name: Configure CLN
+        # We enable debug and rust, disable valgrind for speed on personal forks
+        run: |
+          ./configure --enable-debugbuild --enable-developer --enable-rust --disable-valgrind
+
+      - name: Build CLN
+        # Build in parallel using available processors
+        run: |
+          uv run make -j $(nproc)
+
+      - name: Run Pytest
+        # uses eatmydata for FS speed, runs parallel tests via xdist (-n)
+        run: |
+          uv run eatmydata pytest tests/ -vvv -n ${{ env.PYTEST_PAR }} ${{ env.PYTEST_OPTS }}
