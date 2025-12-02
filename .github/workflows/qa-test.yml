@@ -60,7 +60,7 @@ jobs:
       - name: Configure CLN
         # We enable debug and rust, disable valgrind for speed on personal forks
         run: |
-          ./configure --enable-debugbuild --enable-developer --enable-rust --disable-valgrind
+          ./configure --enable-debugbuild --enable-fuzzing --enable-address-sanitizer --enable-ub-sanitizer --disable-valgrind
 
       - name: Build CLN
         # Build in parallel using available processors
