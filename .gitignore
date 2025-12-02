@@ -106,3 +106,6 @@ autogenerate-examples-status.log
 result
 result-[0-9]*
 tests/plugins/channeld_fakenet
+
+# Ignore allure
+allure*/
