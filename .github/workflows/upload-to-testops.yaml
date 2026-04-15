@@ -76,6 +76,13 @@ jobs:
       - name: Install allure-pytest
         run: uv pip install allure-pytest --break-system-packages
 
+      - name: Install allurectl
+        uses: allure-framework/setup-allurectl@v1
+        with:
+          allure-endpoint: ${{ secrets.ALLURE_ENDPOINT }}
+          allure-token: ${{ secrets.ALLURE_TOKEN }}
+          allure-project-id: ${{ secrets.ALLURE_PROJECT_ID }}
+
       - name: Run test_opening
         run: |
           sg wireshark "uv run eatmydata pytest tests/test_opening.py \
@@ -85,41 +92,10 @@ jobs:
             --durations=10 \
             --alluredir=${ALLURE_RESULTS}"
 
-      - name: Upload allure-results artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: allure-results-dualfund-${{ matrix.EXPERIMENTAL_DUAL_FUND }}
-          path: allure-results/
-          if-no-files-found: ignore
-
-  upload-to-testops:
-    name: Upload all results to Allure TestOps
-    needs: test-opening
-    if: always()
-    runs-on: ubuntu-24.04
-    env:
-      ALLURE_ENDPOINT: ${{ secrets.ALLURE_ENDPOINT }}
-      ALLURE_TOKEN: ${{ secrets.ALLURE_TOKEN }}
-      ALLURE_PROJECT_ID: ${{ secrets.ALLURE_PROJECT_ID }}
-      ALLURE_LAUNCH_NAME: "test_opening #${{ github.run_number }}"
-      ALLURE_LAUNCH_TAGS: "test_opening, ${{ github.ref_name }}"
-      ALLURE_RESULTS: allure-results
-
-    steps:
-      - name: Download all allure-results artifacts
-        uses: actions/download-artifact@v4
-        with:
-          pattern: allure-results-dualfund-*
-          merge-multiple: true
-          path: allure-results/
-
-      - name: Install and configure allurectl
-        uses: allure-framework/setup-allurectl@v1
-        with:
-          allure-endpoint: ${{ secrets.ALLURE_ENDPOINT }}
-          allure-token: ${{ secrets.ALLURE_TOKEN }}
-          allure-project-id: ${{ secrets.ALLURE_PROJECT_ID }}
-
       - name: Upload results to Allure TestOps
+        if: always()
+        env:
+          # Unset any launch ID set by setup-allurectl so each matrix job
+          # creates its own independent launch from ALLURE_LAUNCH_NAME.
+          ALLURE_LAUNCH_ID: ""
         run: allurectl upload ${ALLURE_RESULTS}
