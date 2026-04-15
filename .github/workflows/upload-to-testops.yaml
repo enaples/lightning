@@ -37,6 +37,7 @@ jobs:
       ALLURE_PROJECT_ID: ${{ secrets.ALLURE_PROJECT_ID }}
       ALLURE_LAUNCH_NAME: "test_opening dual_fund=${{ matrix.EXPERIMENTAL_DUAL_FUND }} #${{ github.run_number }}"
       ALLURE_LAUNCH_TAGS: "test_opening, dual_fund=${{ matrix.EXPERIMENTAL_DUAL_FUND }}, ${{ github.ref_name }}"
+      ALLURE_JOB_UID: "test-opening-dualfund-${{ matrix.EXPERIMENTAL_DUAL_FUND }}"
       ALLURE_RESULTS: allure-results
 
     steps:
