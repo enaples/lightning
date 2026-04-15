@@ -91,16 +91,7 @@ jobs:
               -vvv \
               --timeout=1800 \
               --durations=10 \
-              --alluredir=${ALLURE_RESULTS} \
-              --junit-xml=report.xml"
-
-      - name: Upload JUnit XML (GitHub artifact fallback)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: junit-results-dualfund-${{ matrix.EXPERIMENTAL_DUAL_FUND }}
-          path: report.xml
-          if-no-files-found: ignore
+              --alluredir=${ALLURE_RESULTS}"
 
       - name: Upload allure-results (GitHub artifact fallback)
         if: always()
