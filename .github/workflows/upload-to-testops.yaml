@@ -1,0 +1,110 @@
+---
+name: Minimal CI - test_opening (Allure TestOps)
+on:
+  push:
+    branches: ["master"]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  SLOW_MACHINE: 1
+  SCCACHE_GHA_ENABLED: "true"
+  RUST_PROFILE: small
+  TEST_LOG_IGNORE_ERRORS: "1"
+
+jobs:
+  test-opening:
+    name: "test_opening (dual_fund=${{ matrix.EXPERIMENTAL_DUAL_FUND }})"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        EXPERIMENTAL_DUAL_FUND: [0, 1]
+    env:
+      VALGRIND: 0
+      COMPAT: 1
+      TEST_DEBUG: 1
+      TEST_DB_PROVIDER: sqlite3
+      TEST_NETWORK: regtest
+      EXPERIMENTAL_DUAL_FUND: ${{ matrix.EXPERIMENTAL_DUAL_FUND }}
+      # Allure TestOps configuration
+      ALLURE_ENDPOINT: ${{ secrets.ALLURE_ENDPOINT }}
+      ALLURE_TOKEN: ${{ secrets.ALLURE_TOKEN }}
+      ALLURE_PROJECT_ID: ${{ secrets.ALLURE_PROJECT_ID }}
+      ALLURE_LAUNCH_NAME: "test_opening dual_fund=${{ matrix.EXPERIMENTAL_DUAL_FUND }} #${{ github.run_number }}"
+      ALLURE_LAUNCH_TAGS: "test_opening, dual_fund=${{ matrix.EXPERIMENTAL_DUAL_FUND }}, ${{ github.ref_name }}"
+      ALLURE_RESULTS: allure-results
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/ci-cache
+          key: apt-${{ runner.os }}
+
+      - name: Install dependencies
+        run: bash -x .github/scripts/setup.sh
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Build
+        env:
+          RUSTC_WRAPPER: sccache
+        run: |
+          ./configure --enable-debugbuild CC="sccache gcc"
+          uv run make -j $(nproc)
+
+      - name: Install allure-pytest
+        run: uv pip install allure-pytest --break-system-packages
+
+      - name: Install and configure allurectl
+        uses: allure-framework/setup-allurectl@v1
+        with:
+          allure-endpoint: ${{ secrets.ALLURE_ENDPOINT }}
+          allure-token: ${{ secrets.ALLURE_TOKEN }}
+          allure-project-id: ${{ secrets.ALLURE_PROJECT_ID }}
+
+      - name: Run test_opening via allurectl watch
+        run: |
+          allurectl watch -- \
+            sg wireshark "uv run eatmydata pytest tests/test_opening.py \
+              -n $(($(nproc) + 1)) \
+              -vvv \
+              --timeout=1800 \
+              --durations=10 \
+              --alluredir=${ALLURE_RESULTS} \
+              --junit-xml=report.xml"
+
+      - name: Upload JUnit XML (GitHub artifact fallback)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-results-dualfund-${{ matrix.EXPERIMENTAL_DUAL_FUND }}
+          path: report.xml
+          if-no-files-found: ignore
+
+      - name: Upload allure-results (GitHub artifact fallback)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: allure-results-dualfund-${{ matrix.EXPERIMENTAL_DUAL_FUND }}
+          path: allure-results/
+          if-no-files-found: ignore
