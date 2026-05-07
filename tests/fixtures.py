@@ -58,6 +58,21 @@ def node_factory(request, directory, test_name, bitcoind, executor, db_provider,
         raise Exception("At least one lightning exited with unexpected non-zero return code")
 
 
+@pytest.fixture
+def use_vls(request):
+    """True when pytest was invoked selecting the `vls` marker (`-m vls`),
+    False otherwise. Lets @pytest.mark.vls tests run as ordinary tests by
+    default and switch the signer on only for explicit VLS runs."""
+    markexpr = request.config.getoption("-m") or ""
+    if "vls" in markexpr.split():
+        if not env("REMOTE_SIGNER_PATH") and not env("VLS_AUTO_BUILD"):
+            pytest.skip(
+                'VLS tests skipped: set REMOTE_SIGNER_PATH (path to pre-built vlsd) '
+                'or VLS_AUTO_BUILD=1 to enable'
+            )
+    return False
+
+
 class LightningNode(utils.LightningNode):
     def __init__(self, *args, use_vls=None, **kwargs):
         # Yes, we really want to test the local development version, not
