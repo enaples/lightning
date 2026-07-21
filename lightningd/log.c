@@ -4,6 +4,7 @@
 #include <ccan/io/io.h>
 #include <ccan/read_write_all/read_write_all.h>
 #include <ccan/str/hex/hex.h>
+#include <ccan/take/take.h>
 #include <ccan/tal/link/link.h>
 #include <ccan/tal/str/str.h>
 #include <common/clock_time.h>
@@ -18,6 +19,12 @@
 
 /* What logging level to use if they didn't specify */
 #define DEFAULT_LOGLEVEL LOG_INFORM
+
+/* How much of a log message we're prepared to format on the stack: log
+ * messages are unbounded (a plugin can send us whatever it likes), and a
+ * stack buffer that large would smash our stack, so anything longer than
+ * this gets formatted onto tmpctx instead. */
+#define LOG_STACK_STRLEN_MAX 512
 
 /* Once we're up and running, this is set up. */
 struct logger *crashlog;
@@ -393,7 +400,8 @@ static void log_to_files(const char *log_prefix,
 		 + strlen(level_prefix(level))
 		 + sizeof(nodestr)
 		 + strlen(entry_prefix)
-		 + str_len];
+		 + (str_len > LOG_STACK_STRLEN_MAX
+		    ? LOG_STACK_STRLEN_MAX : str_len)];
 	bool filtered;
 
 	if (print_timestamps) {
@@ -432,7 +440,18 @@ static void log_to_files(const char *log_prefix,
 				       log_prefix, tstamp, level_prefix(level),
 				       nodestr,
 				       entry_prefix, (int)str_len, str);
-		assert(len < sizeof(buf));
+		/* Didn't fit on the stack?  Then use the heap. */
+		if (len >= sizeof(buf)) {
+			if (!node_id)
+				entry = tal_fmt(tmpctx, "%s%s%s %s: %.*s\n",
+						log_prefix, tstamp, level_prefix(level),
+						entry_prefix, (int)str_len, str);
+			else
+				entry = tal_fmt(tmpctx, "%s%s%s %s-%s: %.*s\n",
+						log_prefix, tstamp, level_prefix(level),
+						nodestr,
+						entry_prefix, (int)str_len, str);
+		}
 	}
 
 	/* In complex configurations, we tell loggers to overshare: then we
@@ -658,7 +677,7 @@ void logv(struct logger *log, enum log_level level,
 	int save_errno = errno;
 	struct log_hdr l;
 	size_t log_len;
-	char *logmsg;
+	char *logmsg, *capped;
 
 	/* This is WARN_UNUSED_RESULT, because everyone should somehow deal
 	 * with OOM, even though nobody does. */
@@ -676,15 +695,17 @@ void logv(struct logger *log, enum log_level level,
 	maybe_print(log, &l, logmsg, NULL);
 	maybe_notify_log(log, &l, logmsg);
 
-	logmsg = cap_header(tmpctx, &l, logmsg);
-	add_entry(log->log_book, &l, logmsg, NULL);
+	/* Note: this can return tal-allocated memory off tmpctx, so keep
+	 * logmsg itself around for the free() below! */
+	capped = cap_header(tmpctx, &l, logmsg);
+	add_entry(log->log_book, &l, capped, NULL);
 
 	if (call_notifier)
 		notify_warning(log->log_book->ld,
 			       l.level,
 			       l.time,
 			       l.prefix->prefix,
-			       logmsg);
+			       capped);
 	free(logmsg);
 
 	errno = save_errno;
@@ -697,6 +718,7 @@ void log_io(struct logger *log, enum log_level dir,
 {
 	int save_errno = errno;
 	struct log_hdr l;
+	const char *capped;
 
 	assert(dir == LOG_IO_IN || dir == LOG_IO_OUT);
 
@@ -712,8 +734,16 @@ void log_io(struct logger *log, enum log_level dir,
 			     log->log_book->default_print_level,
 			     log->log_book->log_files);
 
-	str = cap_header(tmpctx, &l, str);
-	add_entry(log->log_book, &l, str, data);
+	/* Note: this can return tal-allocated memory off tmpctx, so keep
+	 * str itself around: we may have to free it below! */
+	capped = cap_header(tmpctx, &l, str);
+	add_entry(log->log_book, &l, capped, data);
+
+	/* add_entry() copied it into the ringbuf, so we're done with them. */
+	if (taken(str))
+		tal_free(str);
+	if (taken(data))
+		tal_free(data);
 	errno = save_errno;
 }
 
