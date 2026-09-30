@@ -76,6 +76,9 @@ stdenv.mkDerivation {
 
   configureFlags = [ "--disable-valgrind" ];
 
+  # configure detects python via `uv`, which isn't available here.
+  preConfigure = "export PYTHON=python3";
+
   enableParallelBuilding = true;
 
   # workaround for build issue, happens only x86_64-darwin, not aarch64-darwin
